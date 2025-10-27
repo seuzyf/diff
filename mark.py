@@ -1,9 +1,14 @@
+# 文件名: mark.py
+# 描述: (已修改) 接收命令行参数自动加载模板，并实现加载时自适应缩放。
+
 import os
 import cv2
 import numpy as np
 import time
 import threading
 import queue
+import json
+import sys # --- 新增: 用于读取命令行参数 ---
 from tkinter import *
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
@@ -12,7 +17,7 @@ import imutils
 class ImageAlignmentApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("图片位置校正工具")
+        self.root.title("Mark点配置工具")
         self.root.state('zoomed')
 
         # 初始化变量
@@ -22,8 +27,6 @@ class ImageAlignmentApp:
         self.display_image_tk = None
         self.reference_points = []
         self.mark_ids = []
-        self.input_dir = None
-        self.output_dir = None
         self.scale_factor = 1.0
         self.current_scale = 1.0
         self.canvas_img_id = None
@@ -31,14 +34,16 @@ class ImageAlignmentApp:
         self.canvas_y = 0
         self.template_rois = []
         self.template_centers = []
-        self.delete_after_process = BooleanVar(value=False)  # 新增：自动删除标志
-
-        # --- 新增的变量 ---
-        self.monitoring = False  # 监控状态标志
-        self.monitor_thread = None # 监控线程
-        self.processed_files = set() # 存储已处理的文件名
-        self.status_queue = queue.Queue() # 用于线程安全的状态更新
-        self.error_queue = queue.Queue()  # 新增：错误消息队列
+        
+        # --- 配置保存路径 ---
+        self.config_dir = "config"
+        os.makedirs(self.config_dir, exist_ok=True)
+        self.json_path = os.path.join(self.config_dir, "marks.json")
+        self.roi_paths = [
+            os.path.join(self.config_dir, "mark_roi_1.png"),
+            os.path.join(self.config_dir, "mark_roi_2.png"),
+            os.path.join(self.config_dir, "mark_roi_3.png")
+        ]
 
         # 创建GUI组件
         self.create_widgets()
@@ -57,8 +62,12 @@ class ImageAlignmentApp:
         self.start_x = None
         self.start_y = None
 
-        # 启动队列检查循环
-        self.check_queue()
+        self.status_label = Label(self.root, text="请加载模板图，并依次框选3个Mark点", bd=1, relief=SUNKEN, anchor=W)
+        self.status_label.pack(fill=X, padx=10, pady=5)
+        
+        # --- 修改: 启动时检查参数 ---
+        self.root.after(100, self.process_initial_load)
+        # --- 结束修改 ---
 
     def create_widgets(self):
         main_frame = Frame(self.root)
@@ -93,40 +102,11 @@ class ImageAlignmentApp:
         
         Button(points_frame, text="刷新显示", command=self.redraw_marks).pack(fill=X, pady=2)
         
-        process_frame = LabelFrame(control_frame, text="3. 监控与处理", padx=5, pady=5)
+        process_frame = LabelFrame(control_frame, text="3. 保存", padx=5, pady=5)
         process_frame.pack(fill=X, pady=5)
         
-        self.btn_select_input = Button(process_frame, text="选择输入文件夹", command=self.select_input_dir)
-        self.btn_select_input.pack(fill=X, pady=2)
-        self.input_dir_label = Label(process_frame, text="未选择", wraplength=280, justify=LEFT)
-        self.input_dir_label.pack(fill=X, pady=2)
-        
-        self.btn_select_output = Button(process_frame, text="选择输出文件夹", command=self.select_output_dir)
-        self.btn_select_output.pack(fill=X, pady=2)
-        self.output_dir_label = Label(process_frame, text="未选择", wraplength=280, justify=LEFT)
-        self.output_dir_label.pack(fill=X, pady=2)
-        
-        # 新增：自动删除原图选项
-        auto_delete_frame = Frame(process_frame)
-        auto_delete_frame.pack(fill=X, pady=5)
-        self.chk_auto_delete = Checkbutton(auto_delete_frame, text="处理后删除原图", 
-                                          variable=self.delete_after_process,
-                                          onvalue=True, offvalue=False)
-        self.chk_auto_delete.pack(side=LEFT, padx=5)
-        
-        # 警告标签
-        self.warning_label = Label(process_frame, text="", fg="red", wraplength=280, justify=LEFT)
-        self.warning_label.pack(fill=X, pady=2)
-        
-        # --- 修改的按钮区域 ---
-        monitor_control_frame = Frame(process_frame)
-        monitor_control_frame.pack(fill=X, pady=5)
-        
-        self.start_button = Button(monitor_control_frame, text="开始监控", command=self.start_monitoring, bg="#4CAF50", fg="white")
-        self.start_button.pack(side=LEFT, expand=True, fill=X, padx=2)
-        
-        self.stop_button = Button(monitor_control_frame, text="停止监控", command=self.stop_monitoring, bg="#f44336", fg="white", state=DISABLED)
-        self.stop_button.pack(side=LEFT, expand=True, fill=X, padx=2)
+        self.save_button = Button(process_frame, text="保存Mark点并退出", command=self.save_and_close, bg="#4CAF50", fg="white", height=2)
+        self.save_button.pack(fill=X, pady=5)
         
         image_frame = Frame(main_frame)
         image_frame.pack(side=RIGHT, fill=BOTH, expand=True)
@@ -141,223 +121,185 @@ class ImageAlignmentApp:
         
         h_scroll.config(command=self.canvas.xview)
         v_scroll.config(command=self.canvas.yview)
-        
-        self.status_label = Label(self.root, text="准备就绪", bd=1, relief=SUNKEN, anchor=W)
-        self.status_label.pack(fill=X, padx=10, pady=5)
-    
-    def start_monitoring(self):
-        """开始监控文件夹"""
-        # 验证输入
-        if not self.template_image is not None:
-            messagebox.showerror("错误", "请先选择模板图片")
-            return
-        if len(self.reference_points) != 3:
-            messagebox.showerror("错误", "请选择三个有效的标记区域")
-            return
-        if not self.input_dir:
-            messagebox.showerror("错误", "请选择待处理的输入文件夹")
-            return
-        if not self.output_dir:
-            messagebox.showerror("错误", "请选择输出文件夹")
-            return
-        if self.input_dir == self.output_dir:  # 新增：检查路径是否相同
-            messagebox.showerror("错误", "输入路径和输出路径不能相同！")
-            return
 
-        self.monitoring = True
-        self.processed_files.clear() # 每次开始都清空已处理列表
-        
-        # 禁用按钮
-        self.start_button.config(state=DISABLED)
-        self.stop_button.config(state=NORMAL)
-        self.btn_select_template.config(state=DISABLED)
-        self.btn_select_input.config(state=DISABLED)
-        self.btn_select_output.config(state=DISABLED)
-        self.chk_auto_delete.config(state=DISABLED)  # 禁用自动删除选项
-        
-        # 启动监控线程
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.monitor_thread.start()
-        
-        self.update_status("监控已开始...")
+    # --- 新增: 处理启动加载 ---
+    def process_initial_load(self):
+        """检查命令行参数或加载现有配置"""
+        passed_path = None
+        if len(sys.argv) > 1:
+            passed_path = sys.argv[1]
 
-    def stop_monitoring(self):
-        """停止监控"""
-        self.monitoring = False
-        if self.monitor_thread:
-            self.monitor_thread.join(timeout=1) # 等待线程结束
+        if passed_path and os.path.exists(passed_path):
+            self.update_status(f"已自动加载模板: {os.path.basename(passed_path)}")
+            self.template_path = passed_path
+            self.template_label.config(text=os.path.basename(self.template_path))
+            self.btn_select_template.config(state=DISABLED) # 禁用按钮
+            self.load_template_image(self.template_path)
+            self.display_image(auto_fit=True) # 自适应显示
+            self.load_existing_config() # 加载此模板对应的Mark点
+        else:
+            if passed_path:
+                self.update_status(f"错误: 传入路径无效: {passed_path}")
+            # 没传路径，或路径无效，尝试加载上次的配置
+            self.load_existing_config()
+            if self.template_image is not None:
+                # 如果从json加载了图片，也自适应显示
+                self.display_image(auto_fit=True) 
+    # --- 结束新增 ---
 
-        # 启用按钮
-        self.start_button.config(state=NORMAL)
-        self.stop_button.config(state=DISABLED)
-        self.btn_select_template.config(state=NORMAL)
-        self.btn_select_input.config(state=NORMAL)
-        self.btn_select_output.config(state=NORMAL)
-        self.chk_auto_delete.config(state=NORMAL)  # 重新启用自动删除选项
-
-        self.update_status("监控已停止。")
-
-    def _monitor_loop(self):
-        """在后台线程中运行的监控循环"""
-        while self.monitoring:
-            try:
-                all_files = os.listdir(self.input_dir)
-                image_files = {f for f in all_files if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))}
-                
-                # 找出新增的文件
-                new_files = image_files - self.processed_files
-                
-                if new_files:
-                    for filename in new_files:
-                        if not self.monitoring: break # 如果在处理过程中点击停止，则退出
-                        self.status_queue.put(f"检测到新图片: {filename}，正在处理...")
-                        time.sleep(3)
-                        self._process_single_image(filename)
-                        self.processed_files.add(filename) # 加入已处理集合
-                        self.status_queue.put(f"处理完成: {filename}")
-                
-                if not self.monitoring: break
-
-                self.status_queue.put(f"正在监控中... {len(self.processed_files)}个文件已处理。")
-                time.sleep(2) # 每2秒扫描一次
-            except FileNotFoundError:
-                self.error_queue.put(f"输入文件夹 '{self.input_dir}' 不存在")
-                self.stop_monitoring() # 自动停止
-                break
-            except Exception as e:
-                self.error_queue.put(f"监控线程出错: {str(e)}")
-                time.sleep(5) # 出错后等待更长时间
-
-    def _process_single_image(self, filename):
-        """处理单张图片的逻辑"""
-        input_path = os.path.join(self.input_dir, filename)
-        output_path = os.path.join(self.output_dir, filename)
-        
+    def load_existing_config(self):
+        """尝试加载已有的Mark配置"""
         try:
-            image = cv2.imread(input_path)
-            if image is None: 
-                self.error_queue.put(f"无法读取图片: {filename}")
-                return
-
-            # 检查图片大小是否与模板一致
-            if image.shape != self.template_image.shape:
-                self.error_queue.put(f"图片尺寸不匹配: {filename}\n模板尺寸: {self.template_image.shape[:2]}\n当前图片尺寸: {image.shape[:2]}")
-                return
-
-            current_points = []
-            for idx, roi in enumerate(self.template_rois):
-                center_x, center_y = self.template_centers[idx]
-                img_height, img_width = image.shape[:2]
-                search_size = min(img_width, img_height) // 10
+            if os.path.exists(self.json_path):
+                with open(self.json_path, 'r') as f:
+                    config = json.load(f)
                 
-                x1 = max(0, center_x - search_size)
-                y1 = max(0, center_y - search_size)
-                x2 = min(img_width, center_x + search_size)
-                y2 = min(img_height, center_y + search_size)
+                # 仅当没有传入路径时，才使用JSON中的路径
+                if self.template_path is None: 
+                    self.template_path = config.get('template_path')
                 
-                search_area = image[y1:y2, x1:x2]
-                if search_area.size == 0:
-                    self.error_queue.put(f"在图片 {filename} 中搜索区域无效")
-                    return
-                
-                result = cv2.matchTemplate(search_area, roi, cv2.TM_CCOEFF_NORMED)
-                (_, maxVal, _, maxLoc) = cv2.minMaxLoc(result)
-                
-                if maxVal < 0.5:
-                    self.error_queue.put(f"在图片 {filename} 中标记点匹配度低 ({maxVal:.2f})")
-                    return
-                
-                (startX, startY) = maxLoc
-                abs_startX, abs_startY = startX + x1, startY + y1
-                centerX, centerY = abs_startX + roi.shape[1] // 2, abs_startY + roi.shape[0] // 2
-                current_points.append((centerX, centerY))
+                # 如果当前模板路径与配置中的路径匹配，则加载Mark点
+                if self.template_path and self.template_path == config.get('template_path'):
+                    self.template_centers = config.get('centers', [])
+                    self.reference_points = config.get('rects', []) # 加载矩形框
+                    rois_loaded = 0
+                    self.template_rois = []
+                    
+                    if not self.template_image: # 确保图像已加载
+                        self.load_template_image(self.template_path)
 
-            if len(current_points) != 3:
-                self.error_queue.put(f"在图片 {filename} 中未能找到所有3个标记点")
-                return
-            
-            template_points = np.float32(self.template_centers)
-            current_points = np.float32(current_points)
-
-            M, _ = cv2.estimateAffinePartial2D(current_points, template_points)
-            if M is None:
-                self.error_queue.put(f"无法为图片 {filename} 计算变换矩阵")
-                return
-
-            rows, cols = self.template_image.shape[:2]
-            aligned_image = cv2.warpAffine(image, M, (cols, rows), flags=cv2.INTER_LINEAR,
-                                           borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-            
-            cv2.imwrite(output_path, aligned_image)
-            
-            # 新增：如果勾选了自动删除选项，则删除原图
-            if self.delete_after_process.get():
-                try:
-                    os.remove(input_path)
-                    self.status_queue.put(f"已删除原图: {filename}")
-                except Exception as e:
-                    self.error_queue.put(f"删除原图失败: {str(e)}")
+                    for i in range(len(self.template_centers)):
+                        roi_path = self.roi_paths[i]
+                        if os.path.exists(roi_path):
+                            roi = cv2.imread(roi_path)
+                            if roi is not None:
+                                self.template_rois.append(roi)
+                                rois_loaded += 1
+                    
+                    if len(self.reference_points) == 3 and rois_loaded == 3:
+                        self.points_status.config(text=f"已加载 3/3 个标记区域")
+                        self.update_status("已加载现有配置。可重新框选或直接退出。")
+                        self.update_delete_buttons()
+                        self.redraw_marks() # 确保加载后重绘
+                    else:
+                        # 配置不完整，清空
+                        self.reference_points = []
+                        self.template_rois = []
+                        self.template_centers = []
+                else:
+                    # 模板不匹配，清空旧标记
+                    self.reference_points = []
+                    self.template_rois = []
+                    self.template_centers = []
 
         except Exception as e:
-            self.error_queue.put(f"处理 {filename} 时出错: {str(e)}")
+            print(f"加载旧配置失败: {e}")
+            self.reference_points = []
+            self.template_rois = []
+            self.template_centers = []
 
-    def check_queue(self):
-        """定期检查队列并更新GUI状态标签"""
-        try:
-            # 检查状态队列
-            message = self.status_queue.get_nowait()
-            self.status_label.config(text=message)
-        except queue.Empty:
-            pass
+
+    def save_and_close(self):
+        """保存配置到config文件夹并退出"""
+        if len(self.reference_points) != 3 or len(self.template_rois) != 3 or len(self.template_centers) != 3:
+            messagebox.showerror("错误", "必须选择三个有效的标记区域才能保存！")
+            return
+        
+        if not self.template_path or not self.template_image is not None:
+            messagebox.showerror("错误", "模板图片未成功加载！")
+            return
             
         try:
-            # 检查错误队列并弹出对话框
-            error_msg = self.error_queue.get_nowait()
-            messagebox.showerror("处理错误", error_msg)
-        except queue.Empty:
-            pass
+            # 1. 保存 ROIs
+            for i in range(3):
+                cv2.imwrite(self.roi_paths[i], self.template_rois[i])
             
-        finally:
-            self.root.after(100, self.check_queue)
+            # 2. 保存 JSON (中心点 和 矩形框)
+            config = {
+                "template_path": self.template_path,
+                "centers": self.template_centers,
+                "rects": self.reference_points # 保存矩形框
+            }
+            with open(self.json_path, 'w') as f:
+                json.dump(config, f, indent=4)
+                
+            messagebox.showinfo("成功", f"Mark点配置已成功保存到 {self.config_dir} 目录。")
+            self.root.destroy() # 关闭窗口
+
+        except Exception as e:
+            messagebox.showerror("保存失败", f"保存Mark配置时出错: {str(e)}")
+
 
     def update_status(self, message):
-        """将状态消息放入队列"""
-        self.status_queue.put(message)
+        """更新状态栏文本"""
+        self.status_label.config(text=message)
 
 
     def select_template(self):
-        self.template_path = filedialog.askopenfilename(
+        path = filedialog.askopenfilename(
             title="选择模板图片",
             filetypes=[("图片文件", "*.jpg;*.jpeg;*.png;*.bmp"), ("所有文件", "*.*")]
         )
-        if self.template_path:
-            self.template_label.config(text=os.path.basename(self.template_path))
-            self.load_template_image()
+        if path:
+            # 清空旧的标记
             self.reference_points = []
             self.mark_ids = []
             self.template_rois = []
             self.template_centers = []
             self.points_status.config(text="已选择 0/3 个标记区域")
-            self.update_status("请选择三个标记区域")
             self.update_delete_buttons()
-    
-    def load_template_image(self):
-        self.template_image = cv2.imread(self.template_path)
-        if self.template_image is not None:
-            self.current_scale = 0.05
-            self.canvas_x = 0
-            self.canvas_y = 0
-            self.display_image()
-        else:
-            messagebox.showerror("错误", "无法加载模板图片")
 
-    def display_image(self):
+            self.template_path = path
+            self.template_label.config(text=os.path.basename(self.template_path))
+            self.load_template_image(self.template_path)
+            self.display_image(auto_fit=True) # --- 修改: 手动选择也自适应 ---
+            self.update_status("请选择三个标记区域")
+    
+    def load_template_image(self, path):
+        self.template_image = cv2.imread(path)
+        if self.template_image is None:
+            messagebox.showerror("错误", "无法加载模板图片")
+            self.template_path = None
+            self.template_label.config(text="未选择")
+            self.btn_select_template.config(state=NORMAL) # 确保按钮可用
+
+    # --- 修改: 增加 auto_fit 功能 ---
+    def display_image(self, auto_fit=False):
         if self.template_image is None: return
+
+        # --- 新增: 自适应缩放逻辑 ---
+        if auto_fit:
+            # 强制Tkinter更新画布尺寸
+            self.canvas.update_idletasks() 
+            canvas_w = self.canvas.winfo_width()
+            canvas_h = self.canvas.winfo_height()
+            
+            if canvas_w > 1 and canvas_h > 1: # 确保画布已渲染
+                img_h, img_w = self.template_image.shape[:2]
+                if img_w == 0 or img_h == 0: return
+
+                scale_w = canvas_w / img_w
+                scale_h = canvas_h / img_h
+                
+                # 取较小的比例并留出一点边距
+                self.current_scale = min(scale_w, scale_h) * 0.98 
+                self.current_scale = max(0.01, self.current_scale) # 最小缩放
+                
+                self.canvas_x = 0 # 自动适应时重置视图
+                self.canvas_y = 0
+            else:
+                # 画布未就绪，使用默认值
+                self.current_scale = 0.1 
+        # --- 结束新增 ---
             
         h, w = self.template_image.shape[:2]
         scaled_w = int(w * self.current_scale)
         scaled_h = int(h * self.current_scale)
         
+        # 避免尺寸为0
+        if scaled_w <= 0 or scaled_h <= 0:
+            return
+            
         display_image = cv2.resize(self.template_image, (scaled_w, scaled_h))
         display_image = cv2.cvtColor(display_image, cv2.COLOR_BGR2RGB)
         
@@ -373,13 +315,17 @@ class ImageAlignmentApp:
         self.redraw_marks()
         
     def redraw_marks(self):
+        if not self.scale_factor or self.scale_factor == 0: return
+        
         for mark_id in self.mark_ids:
             self.canvas.delete(mark_id[0])
             self.canvas.delete(mark_id[1])
         self.mark_ids = []
         for idx, (x1, y1, x2, y2) in enumerate(self.reference_points):
-            sx1, sy1 = x1 * self.current_scale, y1 * self.current_scale
-            sx2, sy2 = x2 * self.current_scale, y2 * self.current_scale
+            # --- 修改: 坐标换算 ---
+            # 原始坐标 -> 显示坐标
+            sx1, sy1 = x1 / self.scale_factor, y1 / self.scale_factor
+            sx2, sy2 = x2 / self.scale_factor, y2 / self.scale_factor
             rect_id = self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="red", width=2)
             text_id = self.canvas.create_text(sx1, sy1 - 15, text=f"Mark{idx+1}", fill="red", font=("Arial", 10, "bold"), anchor=NW)
             self.mark_ids.append((rect_id, text_id))
@@ -425,19 +371,26 @@ class ImageAlignmentApp:
         end_y = self.canvas.canvasy(event.y)
         
         if abs(end_x - self.start_x) > 5 and abs(end_y - self.start_y) > 5:
+            # 转换为原始图像坐标
             x1, y1 = int(min(self.start_x, end_x) * self.scale_factor), int(min(self.start_y, end_y) * self.scale_factor)
             x2, y2 = int(max(self.start_x, end_x) * self.scale_factor), int(max(self.start_y, end_y) * self.scale_factor)
-            self.reference_points.append((x1, y1, x2, y2))
             
+            # --- 确保坐标在图像内 ---
+            h, w = self.template_image.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            # --- 结束 ---
+
             roi = self.template_image[y1:y2, x1:x2]
             if roi.size > 0:
+                self.reference_points.append((x1, y1, x2, y2))
                 self.template_rois.append(roi)
                 center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
                 self.template_centers.append((center_x, center_y))
             
             self.points_status.config(text=f"已选择 {len(self.reference_points)}/3 个标记区域")
             self.update_delete_buttons()
-            self.redraw_marks()
+            self.redraw_marks() # 使用原始坐标重绘
         else:
             self.canvas.delete(self.rect_id)
         self.rect_id = None
@@ -447,37 +400,14 @@ class ImageAlignmentApp:
         scale_factor = 1.1
         if event.num == 5 or event.delta == -120:
             self.current_scale /= scale_factor
-            self.current_scale = max(0.1, self.current_scale)
+            self.current_scale = max(0.01, self.current_scale)
         elif event.num == 4 or event.delta == 120:
             self.current_scale *= scale_factor
             self.current_scale = min(10.0, self.current_scale)
-        self.display_image()
+        
+        # --- 修改: 滚轮缩放不自动适应 ---
+        self.display_image(auto_fit=False)
 
-    def select_input_dir(self):
-        input_dir = filedialog.askdirectory(title="选择待处理图片文件夹")
-        if input_dir:
-            # 新增：检查输入输出路径是否相同
-            if self.output_dir and input_dir == self.output_dir:
-                self.warning_label.config(text="警告：输入路径和输出路径不能相同！")
-                return
-            else:
-                self.warning_label.config(text="")
-            
-            self.input_dir = input_dir
-            self.input_dir_label.config(text=input_dir)
-
-    def select_output_dir(self):
-        output_dir = filedialog.askdirectory(title="选择输出文件夹")
-        if output_dir:
-            # 新增：检查输入输出路径是否相同
-            if self.input_dir and output_dir == self.input_dir:
-                self.warning_label.config(text="警告：输出路径和输入路径不能相同！")
-                return
-            else:
-                self.warning_label.config(text="")
-            
-            self.output_dir = output_dir
-            self.output_dir_label.config(text=output_dir)
 
 if __name__ == "__main__":
     root = Tk()
