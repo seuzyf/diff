@@ -1,5 +1,5 @@
 # 文件名: diff_main.py
-# 描述: (已修改) 实现相机直连预览，默认首个相机，修复自动触发。
+# 描述: (已修改) 修复退出时的 AttributeError 竞态条件。
 
 import sys
 import cv2
@@ -66,13 +66,15 @@ class PcbDefectDetector(QWidget):
                 print(f"初始化 CameraManager 失败: {e}")
                 HIK_SDK_AVAILABLE = False
 
-        # --- 修改: 移除 camera_dialog ---
-        # self.camera_dialog = None
         self.camera_thread = None
         self.current_cam_object = None
         self.hik_device_list = None
         self.capture_target_label = None # --- 新增: 记录目标Label ---
-        self.is_camera_previewing = False # --- 新增: 预览状态标志 ---
+        
+        # --- 修改: 预览状态标志 ---
+        self.is_camera_previewing = False # 标志线程是否在运行
+        self.is_previewing_template = False # 标志模板标签是否在接收预览
+        self.is_previewing_image = False # 标志结果标签是否在接收预览
         # --- 结束修改 ---
 
         # ( ... YOLO 加载 ... )
@@ -94,6 +96,10 @@ class PcbDefectDetector(QWidget):
 
         self.initUI()
         self.load_settings()
+        
+        # --- 新增: 启动后自动开始预览 ---
+        self.start_initial_camera_feed()
+        # --- 结束新增 ---
 
     def initUI(self):
         self.setWindowTitle('PCB 异物检测工具 (集成Mark点校正)')
@@ -119,13 +125,16 @@ class PcbDefectDetector(QWidget):
         self.btn_load_folder = QPushButton('加载检测文件夹')
 
         # --- 相机按钮 ---
-        self.btn_cam_template = QPushButton('相机预览') # <-- 修改文本
-        self.btn_cam_image = QPushButton('相机预览')    # <-- 修改文本
+        self.btn_cam_template = QPushButton('点击取图') # <-- 修改文本
+        self.btn_cam_image = QPushButton('点击取图')    # <-- 修改文本
         if not HIK_SDK_AVAILABLE:
             self.btn_cam_template.setEnabled(False)
             self.btn_cam_template.setToolTip("海康SDK未找到")
             self.btn_cam_image.setEnabled(False)
             self.btn_cam_image.setToolTip("海康SDK未找到")
+        else:
+            self.btn_cam_template.setEnabled(False) # 默认禁用，等待预览启动
+            self.btn_cam_image.setEnabled(False) # 默认禁用，等待预览启动
         # --- 结束 ---
 
         self.btn_load_template.clicked.connect(self.load_template)
@@ -135,9 +144,9 @@ class PcbDefectDetector(QWidget):
         self.btn_clear_template.clicked.connect(self.clear_template)
         self.btn_clear_image.clicked.connect(self.clear_image)
 
-        # --- 连接相机按钮 (目标改为 ZoomableLabel) ---
-        self.btn_cam_template.clicked.connect(lambda: self.toggle_camera(self.template_label))
-        self.btn_cam_image.clicked.connect(lambda: self.toggle_camera(self.result_label))
+        # --- 修改: 连接相机按钮到新的 capture 函数 ---
+        self.btn_cam_template.clicked.connect(self.request_capture_template)
+        self.btn_cam_image.clicked.connect(self.request_capture_image)
         # --- 结束 ---
 
         template_layout = QVBoxLayout(template_group)
@@ -337,107 +346,124 @@ class PcbDefectDetector(QWidget):
                     f"错误详情 (已保存到 {error_log_path}):\n{error_content[:500]}...") 
                 return 
 
-            QMessageBox.information(self, "提示", 
-                f"Mark点工具已启动 (自动加载: {os.path.basename(template_to_pass)})。\n\n"
-                "1. 请在工具中依次框选【3个】Mark点。\n"
-                "2. 点击【保存Mark点并退出】。\n\n"
-                "完成后，请勾选主界面的“启用Mark点校正”复选框。")
+            print(f"Mark点工具已启动 (自动加载: {os.path.basename(template_to_pass)})。")
                 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法打开Mark点工具: {e}\n{traceback.format_exc()}")
     
-    # --- 修改: 相机控制逻辑 ---
-    def toggle_camera(self, target_label: ZoomableLabel):
-        """启动或停止相机预览/捕获"""
+    # --- 新增: 启动唯一的相机预览线程 ---
+    def start_initial_camera_feed(self):
+        """启动后自动调用，开启一个相机线程，将画面推送到两个标签。"""
         if not HIK_SDK_AVAILABLE or self.camera_manager is None:
-            QMessageBox.critical(self, "错误", "相机SDK未正确加载。")
+            msg = "海康SDK未找到"
+            self.template_label.setText(msg)
+            self.result_label.setText(msg)
             return
 
-        # 确定是哪个按钮被点击
-        is_template_target = (target_label == self.template_label)
-        btn = self.btn_cam_template if is_template_target else self.btn_cam_image
+        if self.camera_thread and self.camera_thread.isRunning():
+            return # 已经在运行
+            
+        try:
+            devices, self.hik_device_list = self.camera_manager.list_devices()
+            if not devices or not self.hik_device_list:
+                msg = "未找到相机设备"
+                self.template_label.setText(msg)
+                self.result_label.setText(msg)
+                return
 
-        # --- 情况1: 当前正在预览，用户点击进行捕获 ---
-        if self.is_camera_previewing and self.capture_target_label == target_label:
-            if self.camera_thread and self.camera_thread.isRunning():
-                print("发送捕获信号...")
-                btn.setText("采集中...")
-                btn.setEnabled(False)
-                self.camera_thread.capture_and_stop() # 线程内部会处理停止和信号发射
-            return # 等待 frame_captured_signal
+            # 连接到第一个设备
+            device_index = 0
+            self.current_cam_object = self.camera_manager.connect(self.hik_device_list, device_index)
 
-        # --- 情况2: 当前正在预览其他窗口，用户点击当前窗口 ---
-        elif self.is_camera_previewing and self.capture_target_label != target_label:
-             QMessageBox.warning(self, "提示", "请先停止另一个窗口的相机预览或完成取图。")
-             return
+            if self.current_cam_object is None:
+                msg = f"无法连接到相机: {devices[0]}"
+                self.template_label.setText(msg)
+                self.result_label.setText(msg)
+                self.hik_device_list = None # 清理
+                return
 
-        # --- 情况3: 当前没有预览，用户点击启动预览 ---
-        elif not self.is_camera_previewing:
-            try:
-                # 自动选择第一个相机
-                devices, self.hik_device_list = self.camera_manager.list_devices()
-                if not devices or not self.hik_device_list:
-                    QMessageBox.warning(self, "未找到相机", "未枚举到任何海康威视相机设备。")
-                    return
+            self.template_label.setText("正在连接相机...")
+            self.result_label.setText("正在连接相机...")
 
-                # 连接到第一个设备 (index 0)
-                device_index = 0
-                self.current_cam_object = self.camera_manager.connect(self.hik_device_list, device_index)
+            # 创建并启动线程
+            self.camera_thread = hik_camera.CameraThread(self.current_cam_object)
+            self.camera_thread.new_frame_signal.connect(self.update_previews)
+            self.camera_thread.frame_captured_signal.connect(self.on_frame_captured)
+            self.camera_thread.finished.connect(self.on_camera_thread_finished)
+            self.camera_thread.error_signal.connect(self.on_camera_error)
 
-                if self.current_cam_object is None:
-                    QMessageBox.critical(self, "连接失败", f"无法连接到第一个相机: {devices[0]}")
-                    self.hik_device_list = None # 清理
-                    return
+            self.camera_thread.start()
+            
+            # 设置状态标志
+            self.is_camera_previewing = True # 线程在运行
+            self.is_previewing_template = True # 模板侧在接收
+            self.is_previewing_image = True # 结果侧在接收
+            
+            # 启用按钮
+            self.btn_cam_template.setEnabled(True)
+            self.btn_cam_image.setEnabled(True)
+            self.btn_cam_template.setText("点击取图")
+            self.btn_cam_image.setText("点击取图")
 
-                self.capture_target_label = target_label # 记录目标
 
-                # 创建并启动线程
-                self.camera_thread = hik_camera.CameraThread(self.current_cam_object)
-                self.camera_thread.new_frame_signal.connect(self.update_camera_preview)
-                self.camera_thread.frame_captured_signal.connect(self.on_frame_captured)
-                self.camera_thread.finished.connect(self.on_camera_thread_finished)
-                self.camera_thread.error_signal.connect(self.on_camera_error)
+        except Exception as e:
+            QMessageBox.critical(self, "启动失败", f"启动相机时出错: {e}\n{traceback.format_exc()}")
+            self.on_camera_thread_finished() # 出错时确保清理
 
-                self.camera_thread.start()
-                self.is_camera_previewing = True
+    # --- 新增: 响应按钮点击，请求捕获 ---
+    def request_capture_template(self):
+        """模板侧按钮点击：请求捕获"""
+        if self.camera_thread and self.camera_thread.isRunning() and self.is_previewing_template:
+            self.capture_target_label = self.template_label # 设置回调目标
+            self.camera_thread.request_capture() # 请求捕获
+            self.btn_cam_template.setText("采集中...")
+            self.btn_cam_template.setEnabled(False)
+        
+    def request_capture_image(self):
+        """结果侧按钮点击：请求捕获"""
+        if self.camera_thread and self.camera_thread.isRunning() and self.is_previewing_image:
+            self.capture_target_label = self.result_label # 设置回调目标
+            self.camera_thread.request_capture() # 请求捕获
+            self.btn_cam_image.setText("采集中...")
+            self.btn_cam_image.setEnabled(False)
 
-                # 更新按钮状态
-                btn.setText("点击取图")
-                other_btn = self.btn_cam_image if is_template_target else self.btn_cam_template
-                other_btn.setEnabled(False) # 禁用另一个相机按钮
-                target_label.setText("正在连接相机...") # 提示用户
-
-            except Exception as e:
-                QMessageBox.critical(self, "启动失败", f"启动相机时出错: {e}\n{traceback.format_exc()}")
-                self.on_camera_thread_finished() # 出错时确保清理
-
-        # --- 情况4: 其他（理论上不应发生，可能是状态错误） ---
-        else:
-             print("未知的相机状态，请尝试重启程序。")
-
+    # --- 新增: 统一的预览更新槽 ---
     @pyqtSlot(np.ndarray)
-    def update_camera_preview(self, img_bgr):
-        """更新目标Label的图像"""
-        if self.capture_target_label and self.is_camera_previewing:
-            try:
-                h, w, ch = img_bgr.shape
-                if h > 0 and w > 0:
-                    bytes_per_line = ch * w
-                    # 注意 QImage 使用 BGR 数据
-                    q_img = QImage(img_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
-                    pixmap = QPixmap.fromImage(q_img)
-                    self.capture_target_label.setPixmap(pixmap) # 直接更新目标Label
-                else:
-                    self.capture_target_label.setText("无效帧")
+    def update_previews(self, img_bgr):
+        """更新所有仍在“预览模式”的标签"""
+        if not self.is_camera_previewing:
+            return
+            
+        try:
+            h, w, ch = img_bgr.shape
+            if h > 0 and w > 0:
+                bytes_per_line = ch * w
+                # 注意 QImage 使用 BGR 数据
+                q_img = QImage(img_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
+                pixmap = QPixmap.fromImage(q_img)
+                
+                # 如果模板侧在预览，则更新
+                if self.is_previewing_template:
+                    self.template_label.setPixmap(pixmap)
+                
+                # 如果结果侧在预览，则更新
+                if self.is_previewing_image:
+                    self.result_label.setPixmap(pixmap)
+            else:
+                if self.is_previewing_template:
+                    self.template_label.setText("无效帧")
+                if self.is_previewing_image:
+                    self.result_label.setText("无效帧")
 
-            except Exception as e:
-                print(f"更新预览失败: {e}")
-                self.capture_target_label.setText("预览错误")
-                # 可以考虑在这里停止相机
-                # self.stop_camera_feed()
+        except Exception as e:
+            print(f"更新预览失败: {e}")
+            if self.is_previewing_template:
+                self.template_label.setText("预览错误")
+            if self.is_previewing_image:
+                self.result_label.setText("预览错误")
 
     def stop_camera_feed(self):
-        """停止相机预览线程"""
+        """停止相机预览线程 (用于关闭程序)"""
         if self.camera_thread and self.camera_thread.isRunning():
             print("正在停止相机预览...")
             self.camera_thread.stop()
@@ -447,80 +473,105 @@ class PcbDefectDetector(QWidget):
         QMessageBox.critical(self, "相机错误", message)
         self.stop_camera_feed() # 发生错误时停止
 
-    @pyqtSlot(str, int, int) # --- 明确信号参数 ---
-    def on_frame_captured(self, save_path, width, height):
+    # --- 修改: 捕获回调，用于固定画面 ---
+    @pyqtSlot(np.ndarray) 
+    def on_frame_captured(self, captured_image_bgr):
         """相机成功捕获一帧并保存后调用"""
-        print(f"帧已捕获! 保存至: {save_path}, 尺寸: {width}x{height}")
-        # 线程已经停止，状态将在 on_camera_thread_finished 中重置
+        print(f"帧已捕获! 内存中尺寸: {captured_image_bgr.shape}")
+        
         try:
-            pixmap = QPixmap(save_path)
-            if pixmap.isNull():
-                raise Exception(f"加载保存的 PNG 文件失败: {save_path}")
+            h, w, ch = captured_image_bgr.shape
+            if h <= 0 or w <= 0:
+                raise Exception("捕获的图像尺寸无效")
+            
+            bytes_per_line = ch * w
+            q_img = QImage(captured_image_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
+            pixmap = QPixmap.fromImage(q_img)
 
-            # 根据捕获目标更新UI和状态
+            if pixmap.isNull():
+                raise Exception(f"从内存中的 NumPy 数组创建 QPixmap 失败")
+
+            # 保存图像
+            temp_dir = os.path.join("output", "temp_captures")
+            os.makedirs(temp_dir, exist_ok=True)
+            filename = f"capture_{int(time.time())}.jpeg" 
+            save_path = os.path.join(temp_dir, filename)
+            
+            try:
+                cv2.imwrite(save_path, captured_image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                print(f"捕获的帧已保存至: {save_path}")
+            except Exception as e_save:
+                print(f"警告: cv2.imwrite (JPEG) 保存失败: {e_save}")
+                save_path = None
+            
+            if save_path is None:
+                raise Exception("无法将捕获的图像保存到磁盘")
+
+            # --- 修改: 根据目标固定画面 ---
             if self.capture_target_label == self.template_label:
+                self.is_previewing_template = False # <-- 停止预览
+                self.btn_cam_template.setEnabled(False) # 禁用按钮
                 self.template_paths = [save_path]
-                self.template_label.setPixmap(pixmap) # 显示最终捕获的图
+                self.template_label.setPixmap(pixmap) # 固定画面
                 self.btn_load_template.setText(f"已加载: {os.path.basename(save_path)}")
                 self.btn_load_template_folder.setText("加载模板文件夹")
-                # 模板取图后不需要自动检测
 
             elif self.capture_target_label == self.result_label:
+                self.is_previewing_image = False # <-- 停止预览
+                self.btn_cam_image.setEnabled(False) # 禁用按钮
                 self.image_paths = [save_path]
-                self.image_path = save_path # <--- 关键：设置 image_path
+                self.image_path = save_path
                 self.folder = None
-                self.result_label.setPixmap(pixmap) # 显示最终捕获的图
+                self.result_label.setPixmap(pixmap) # 固定画面
                 self.btn_load_image.setText(f"已加载: {os.path.basename(save_path)}")
                 self.btn_load_folder.setText("加载检测文件夹")
                 self.cb_monitor_folder.setEnabled(False)
                 self.cb_monitor_folder.setChecked(False)
 
-                # --- 修复: 确认 image_path 已设置后再触发检测 ---
                 print("相机取图（检测图）完成，自动触发检测...")
-                # 稍微延迟以确保UI更新完成 (可选，但有时有帮助)
-                # QTimer.singleShot(100, self.start_detection)
-                self.start_detection() # 直接调用
-                # --- 结束修复 ---
+                self.start_detection() # 自动检测
             else:
                  print("警告: 捕获目标未知!")
+            
+            self.capture_target_label = None # 清空目标
 
         except Exception as e:
             QMessageBox.critical(self, "处理捕获失败", f"处理捕获的帧时出错: {e}")
             traceback.print_exc()
-        finally:
-             # 确保按钮状态在捕获后重置 (也在 finished 里做)
-             self.reset_camera_buttons()
+            # --- 失败时恢复按钮 ---
+            if self.capture_target_label == self.template_label:
+                self.btn_cam_template.setEnabled(True)
+                self.btn_cam_template.setText("点击取图")
+            elif self.capture_target_label == self.result_label:
+                self.btn_cam_image.setEnabled(True)
+                self.btn_cam_image.setText("点击取图")
 
-
+    # --- 修复: on_camera_thread_finished (添加 hasattr 检查) ---
     def on_camera_thread_finished(self):
         """相机线程结束后的清理工作"""
         print("相机线程已结束，正在清理...")
 
-        # --- 修改: 不再需要 camera_dialog ---
-        # if self.camera_dialog: ...
-
-        if self.current_cam_object and self.camera_manager:
+        # --- 修复: 增加 hasattr 检查以防止退出时报错 ---
+        # 退出时 closeEvent 可能会先删除 camera_manager
+        if self.current_cam_object and hasattr(self, 'camera_manager') and self.camera_manager:
             self.camera_manager.disconnect(self.current_cam_object)
             self.current_cam_object = None
+        # --- 结束修复 ---
 
         self.camera_thread = None
-        self.is_camera_previewing = False # 重置预览状态
-        self.capture_target_label = None # 清空目标
+        self.is_camera_previewing = False # 线程停止
+        self.is_previewing_template = False # 预览停止
+        self.is_previewing_image = False # 预览停止
         self.hik_device_list = None # 清理设备列表
 
         # 重置按钮状态
-        self.reset_camera_buttons()
-
-        print("相机清理完毕")
-
-    def reset_camera_buttons(self):
-        """重置两个相机按钮的文本和状态"""
         self.btn_cam_template.setText("相机预览")
         self.btn_cam_image.setText("相机预览")
         self.btn_cam_template.setEnabled(HIK_SDK_AVAILABLE)
         self.btn_cam_image.setEnabled(HIK_SDK_AVAILABLE)
 
-    # --- 结束相机控制修改 ---
+        print("相机清理完毕")
+    # --- 结束修复 ---
 
     def set_output_directory(self):
         path = QFileDialog.getExistingDirectory(
@@ -532,26 +583,46 @@ class PcbDefectDetector(QWidget):
             self.current_output_dir = path
             QMessageBox.information(self, "设置成功", f"检测结果将保存到:\n{self.current_output_dir}")
 
+    # --- 修改: clear_template (恢复预览) ---
     def clear_template(self):
-        self.stop_camera_feed() # 如果正在预览模板区，停止
+        # self.stop_camera_feed() # 不再需要停止
         self.template_paths = []
         self.template_label.clear()
-        self.template_label.setText("模板图像") # 恢复提示
+        self.template_label.setText("相机预览中...") # 恢复提示
         self.btn_load_template.setText('加载单模板图')
         self.btn_load_template_folder.setText('加载模板文件夹')
+        
+        # --- 恢复预览 ---
+        self.is_previewing_template = True
+        self.btn_cam_template.setEnabled(True)
+        self.btn_cam_template.setText("点击取图")
+        
+        # 如果相机线程已停止，尝试重启
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            self.start_initial_camera_feed()
 
+    # --- 修改: clear_image (恢复预览) ---
     def clear_image(self):
-        self.stop_camera_feed() # 如果正在预览结果区，停止
+        # self.stop_camera_feed() # 不再需要停止
         self.image_path = None
         self.image_paths = []
         self.folder = None
         self.result_label.clear()
-        self.result_label.setText("结果图像") # 恢复提示
+        self.result_label.setText("相机预览中...") # 恢复提示
         self.btn_load_image.setText('加载检测图')
         self.btn_load_folder.setText('加载检测文件夹')
         self.progress_label.setText("就绪")
         self.cb_monitor_folder.setEnabled(False)
         self.cb_monitor_folder.setChecked(False)
+        
+        # --- 恢复预览 ---
+        self.is_previewing_image = True
+        self.btn_cam_image.setEnabled(True)
+        self.btn_cam_image.setText("点击取图")
+        
+        # 如果相机线程已停止，尝试重启
+        if not self.camera_thread or not self.camera_thread.isRunning():
+            self.start_initial_camera_feed()
 
     def create_default_ultralytics_settings(self):
         appdata_dir = os.getenv('APPDATA')
@@ -669,9 +740,6 @@ class PcbDefectDetector(QWidget):
                 else:
                     print(f"跳过损坏的阈值条件: {condition}")
 
-            # --- 移除旧的阈值加载循环 ---
-            # for i, condition in enumerate(settings.get('threshold_conditions', [])): ...
-
             self.cb_use_ai.setChecked(settings.get('use_ai', False))
             if settings.get('combo_method', 'and') == 'and':
                 self.radio_and.setChecked(True)
@@ -720,17 +788,26 @@ class PcbDefectDetector(QWidget):
             self.threshold_ranges.remove(widget)
             widget.deleteLater()
 
+    # --- 修改: 加载模板 (停止预览) ---
     def load_template(self):
-        self.stop_camera_feed() # 加载时停止预览
+        self.is_previewing_template = False # 停止预览
+        self.btn_cam_template.setEnabled(False) # 禁用按钮
+        
         path, _ = QFileDialog.getOpenFileName(self, "选择模板图", "", "图片文件 (*.png *.jpg *.jpeg)")
         if path:
             self.template_paths = [path]
             self.load_and_display_image(path, self.template_label)
             self.btn_load_template.setText(f"已加载: {os.path.basename(path)}")
             self.btn_load_template_folder.setText("加载模板文件夹")
+        else:
+            # 如果用户取消了选择，恢复预览
+            self.clear_template()
 
+    # --- 修改: 加载模板文件夹 (停止预览) ---
     def load_template_folder(self):
-        self.stop_camera_feed() # 加载时停止预览
+        self.is_previewing_template = False # 停止预览
+        self.btn_cam_template.setEnabled(False) # 禁用按钮
+        
         folder = QFileDialog.getExistingDirectory(self, "选择模板图文件夹", "")
         if folder:
             template_paths = []
@@ -738,14 +815,21 @@ class PcbDefectDetector(QWidget):
                 template_paths.extend(glob(os.path.join(folder, ext)))
             if not template_paths:
                 QMessageBox.warning(self, "警告", "文件夹中没有找到图片文件！")
+                self.clear_template() # 恢复预览
                 return
             self.template_paths = template_paths
             self.load_and_display_image(template_paths[0], self.template_label)
             self.btn_load_template_folder.setText(f"已加载: {len(template_paths)}张模板图")
             self.btn_load_template.setText("加载单模板图")
+        else:
+            # 如果用户取消了选择，恢复预览
+            self.clear_template()
 
+    # --- 修改: 加载检测图 (停止预览) ---
     def load_image(self):
-        self.stop_camera_feed() # 加载时停止预览
+        self.is_previewing_image = False # 停止预览
+        self.btn_cam_image.setEnabled(False) # 禁用按钮
+        
         path, _ = QFileDialog.getOpenFileName(self, "选择检测图", "", "图片文件 (*.png *.jpg *.jpeg)")
         if path:
             self.image_path = path
@@ -757,9 +841,15 @@ class PcbDefectDetector(QWidget):
             self.progress_label.setText(f"已选择1张图片")
             self.cb_monitor_folder.setEnabled(False)
             self.cb_monitor_folder.setChecked(False)
+        else:
+            # 如果用户取消了选择，恢复预览
+            self.clear_image()
 
+    # --- 修改: 加载检测文件夹 (停止预览) ---
     def load_image_folder(self):
-        self.stop_camera_feed() # 加载时停止预览
+        self.is_previewing_image = False # 停止预览
+        self.btn_cam_image.setEnabled(False) # 禁用按钮
+        
         self.folder = QFileDialog.getExistingDirectory(self, "选择检测图片文件夹", "")
         if self.folder:
             self.image_paths = []
@@ -779,11 +869,12 @@ class PcbDefectDetector(QWidget):
             self.btn_load_image.setText("加载检测图")
             self.cb_monitor_folder.setEnabled(True)
 
-            # --- 选择文件夹后自动开始监控 ---
             self.cb_monitor_folder.setChecked(True)
             print("检测文件夹已加载，自动开始监控...")
             self.start_detection()
-            # --- 结束 ---
+        else:
+            # 如果用户取消了选择，恢复预览
+            self.clear_image()
 
     def reflash_image_folder(self):
         if self.folder:
@@ -813,16 +904,27 @@ class PcbDefectDetector(QWidget):
             QMessageBox.critical(self, "错误", f"加载图像失败:\n{str(e)}")
             label.setText("加载失败") # 提示用户
 
+    # --- 修改: start_detection (不再停止整个相机线程) ---
     def start_detection(self):
-        # --- 新增: 开始检测前确保相机已停止 ---
-        if self.is_camera_previewing:
-             reply = QMessageBox.question(self, "相机预览中",
-                                         "相机正在预览，开始检测将停止预览并使用当前加载的图片/文件夹。是否继续？",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-             if reply == QMessageBox.No:
+        # 检查 "检测图" 侧是否还在预览
+        if self.is_previewing_image:
+             print("检测开始，自动停止 '检测图' 侧的预览...")
+             # 自动“固定”画面
+             self.is_previewing_image = False
+             self.btn_cam_image.setEnabled(False)
+             # 此时 self.result_label 上是最后一帧画面
+             # 但是 self.image_path 是空的！
+             # 我们必须在此时触发一次捕获
+             if self.camera_thread and self.camera_thread.isRunning():
+                 print("...并自动捕获当前帧用于检测")
+                 self.request_capture_image()
+                 # request_capture_image 会在回调 (on_frame_captured) 中
+                 # 自动调用 self.start_detection()
+                 # 所以我们应该在这里返回，防止双重调用
+                 return 
+             else:
+                 QMessageBox.warning(self, "错误", "相机预览已停止，无法自动取图检测")
                  return
-             self.stop_camera_feed()
-        # --- 结束新增 ---
 
         if hasattr(self, 'detection_thread') and self.detection_thread and self.detection_thread.isRunning():
             QMessageBox.warning(self, "警告", "检测正在进行中，请等待完成或终止！")
@@ -834,11 +936,9 @@ class PcbDefectDetector(QWidget):
 
         monitoring_mode = self.cb_monitor_folder.isChecked() and (self.folder is not None)
 
-        # --- 修改: 即使在监控模式下，也要检查 image_paths 或 folder ---
         if not self.image_paths and not self.folder:
              QMessageBox.warning(self, "警告", "请加载检测图片或选择要监控的文件夹！")
              return
-        # --- 结束修改 ---
 
         current_image_paths = self.image_paths
         if monitoring_mode:
@@ -847,7 +947,6 @@ class PcbDefectDetector(QWidget):
         try:
             threshold_conditions = self.get_threshold_conditions()
             if not threshold_conditions:
-                # QMessageBox is shown in get_threshold_conditions
                 return
 
             os.makedirs(self.current_output_dir, exist_ok=True)
@@ -858,7 +957,6 @@ class PcbDefectDetector(QWidget):
             
             use_alignment = self.cb_use_alignment.isChecked()
 
-            # --- 传递 current_image_paths ---
             self.detection_thread = DetectionThread(
                 self,
                 current_image_paths, # 使用当前的文件列表
@@ -878,13 +976,13 @@ class PcbDefectDetector(QWidget):
             self.btn_detect.setEnabled(False)
             self.btn_stop.setEnabled(True)
             self.btn_view_defects.setEnabled(False)
-            self.cb_monitor_folder.setEnabled(False) # 检测期间禁用监控切换
+            self.cb_monitor_folder.setEnabled(False) 
 
             if monitoring_mode:
                 self.progress_bar.setMaximum(0) # 不定进度条
                 self.progress_label.setText("开始监控...")
             else:
-                max_val = len(current_image_paths) if current_image_paths else 1 # 防止除零
+                max_val = len(current_image_paths) if current_image_paths else 1
                 self.progress_bar.setMaximum(max_val)
                 self.progress_bar.setValue(0)
                 self.progress_label.setText("开始检测...")
@@ -892,7 +990,6 @@ class PcbDefectDetector(QWidget):
             self.detection_thread.start()
         except Exception as e:
             QMessageBox.critical(self, "错误", f"启动检测失败:\n{str(e)}\n{traceback.format_exc()}")
-            # 出错时恢复按钮状态
             self.btn_detect.setEnabled(True)
             self.btn_stop.setEnabled(False)
             if self.folder: self.cb_monitor_folder.setEnabled(True)
@@ -930,7 +1027,6 @@ class PcbDefectDetector(QWidget):
         # 自动删除逻辑 (保持不变)
         if success and not self.cb_monitor_folder.isChecked() and self.cb_auto_delete.isChecked():
             try:
-                # 使用线程结束时处理的文件列表 (从线程获取可能更安全，但暂时用self.image_paths)
                 paths_to_delete = self.detection_thread.processed_files if hasattr(self.detection_thread, 'processed_files') else self.image_paths
                 deleted_count = 0
                 for img_path in paths_to_delete:

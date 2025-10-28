@@ -40,18 +40,37 @@ class DetectionThread(QThread):
         self.use_alignment = use_alignment # <-- 接收参数值
         self.align_template_rois = []
         self.align_template_centers = []
+        self.template_image_for_alignment = None # <-- 新增: 用于存储模板图
+        self.template_gray_for_alignment = None # <-- 新增: 用于存储灰度模板图
         # --- 结束新增 ---
 
     def run(self):
         try:
-            # --- 新增: 如果启用，首先加载Mark点配置 ---
+            # --- 修改: 如果启用，首先加载Mark点配置和模板图 ---
             if self.use_alignment:
                 self.progress_signal.emit(0, "正在加载Mark点校正配置...")
                 if not self.load_alignment_config():
                     self.finished_signal.emit(False, "Mark点校正配置加载失败，请检查config/marks.json")
                     return # 直接返回，不继续执行
+                
+                # --- 新增: 加载模板图以获取尺寸信息 ---
+                if not self.detector.template_paths:
+                    self.finished_signal.emit(False, "Mark点校正失败: 未加载任何模板图")
+                    return
+                try:
+                    self.template_image_for_alignment = cv2.imread(self.detector.template_paths[0])
+                    if self.template_image_for_alignment is None:
+                        raise Exception(f"无法加载模板图: {self.detector.template_paths[0]}")
+                    # --- 新增: 预先转换为灰度图 ---
+                    self.template_gray_for_alignment = cv2.cvtColor(self.template_image_for_alignment, cv2.COLOR_BGR2GRAY)
+                    
+                except Exception as e:
+                    self.finished_signal.emit(False, f"Mark点校正失败: {e}")
+                    return
+                # --- 结束新增 ---
+                
                 self.progress_signal.emit(0, "Mark点配置加载成功。")
-            # --- 结束新增 ---
+            # --- 结束修改 ---
 
             # 1. 预处理模板图（所有模式都需要）
             self.preprocess_templates()
@@ -130,80 +149,135 @@ class DetectionThread(QThread):
             return False
     # --- 结束新增 ---
 
-    # --- 新增: 图像校正方法 ---
+    # --- 替换: 图像校正方法 (使用 Mark点 + ECC 的两步混合校正) ---
     def align_image(self, image):
+        # 检查 Mark ROIs 和模板图是否已加载
         if not self.align_template_rois or len(self.align_template_rois) != 3:
             self.progress_signal.emit(0, "校正失败: Mark ROIs未加载")
             return None
+        if self.template_image_for_alignment is None or self.template_gray_for_alignment is None:
+            self.progress_signal.emit(0, "校正失败: 基准模板图(或灰度图)未加载")
+            return None
 
+        # 检查图片大小是否与模板一致
+        if image.shape != self.template_image_for_alignment.shape:
+            self.progress_signal.emit(0, f"校正失败: 图片尺寸不匹配\n模板: {self.template_image_for_alignment.shape[:2]}\n图片: {image.shape[:2]}")
+            return None
+
+        # === 第 1 步: Mark点粗校正 ===
         current_points = []
-        all_match_values = [] # 记录匹配度
+        all_match_values = []
         for idx, roi in enumerate(self.align_template_rois):
             center_x, center_y = self.align_template_centers[idx]
             img_height, img_width = image.shape[:2]
-
-            search_size_w = max(roi.shape[1] * 2, img_width // 15) # 稍微增大搜索范围
-            search_size_h = max(roi.shape[0] * 2, img_height // 15)
-
-            x1 = max(0, int(center_x - search_size_w / 2))
-            y1 = max(0, int(center_y - search_size_h / 2))
-            x2 = min(img_width, int(center_x + search_size_w / 2))
-            y2 = min(img_height, int(center_y + search_size_h / 2))
-
+            search_size = min(img_width, img_height) // 10 
+            
+            x1 = max(0, int(center_x - search_size))
+            y1 = max(0, int(center_y - search_size))
+            x2 = min(img_width, int(center_x + search_size))
+            y2 = min(img_height, int(center_y + search_size))
+            
             search_area = image[y1:y2, x1:x2]
 
-            if search_area.size == 0 or roi.shape[0] > search_area.shape[0] or roi.shape[1] > search_area.shape[1]:
-                self.progress_signal.emit(0, f"校正失败: Mark {idx+1} 搜索区域无效 (ROI:{roi.shape}, Area:{search_area.shape})")
+            if search_area.size == 0 or (roi.shape[0] > search_area.shape[0] or roi.shape[1] > search_area.shape[1]):
+                self.progress_signal.emit(0, f"校正失败(Pass 1): Mark {idx+1} 搜索区域无效")
                 return None
-
+                
             result = cv2.matchTemplate(search_area, roi, cv2.TM_CCOEFF_NORMED)
             (_, maxVal, _, maxLoc) = cv2.minMaxLoc(result)
-            all_match_values.append(maxVal) # 记录匹配值
-
-            # --- 降低匹配阈值 ---
-            if maxVal < 0.3: # 允许一定的模糊或变形
-                self.progress_signal.emit(0, f"校正失败: Mark {idx+1} 匹配度过低 ({maxVal:.2f})")
+            all_match_values.append(maxVal)
+            
+            if maxVal < 0.5:
+                self.progress_signal.emit(0, f"校正失败(Pass 1): Mark {idx+1} 匹配度过低 ({maxVal:.2f} < 0.5)")
                 return None
-
+            
             (startX, startY) = maxLoc
             abs_startX, abs_startY = startX + x1, startY + y1
             centerX, centerY = abs_startX + roi.shape[1] // 2, abs_startY + roi.shape[0] // 2
             current_points.append((centerX, centerY))
 
-        print(f"Mark点匹配度: {[f'{v:.2f}' for v in all_match_values]}") # 打印匹配度供调试
+        print(f"Pass 1 (Mark点) 匹配度: {[f'{v:.2f}' for v in all_match_values]}")
 
         if len(current_points) != 3:
-            self.progress_signal.emit(0, "校正失败: 未能找到所有3个Mark点")
+            self.progress_signal.emit(0, "校正失败(Pass 1): 未能找到所有3个Mark点")
             return None
-
+            
         template_points = np.float32(self.align_template_centers)
         current_points = np.float32(current_points)
 
-        # M = cv2.getAffineTransform(current_points, template_points)
-        # --- 尝试 estimateAffinePartial2D ---
-        M, _ = cv2.estimateAffinePartial2D(current_points, template_points)
+        M_initial, _ = cv2.estimateAffinePartial2D(current_points, template_points)
+        if M_initial is None:
+            self.progress_signal.emit(0, "校正失败(Pass 1): 无法计算变换矩阵")
+            return None
 
-        if M is None:
-             # --- 如果 estimateAffinePartial2D 失败，尝试 getAffineTransform ---
-             print("estimateAffinePartial2D 失败，尝试 getAffineTransform...")
-             try:
-                 M = cv2.getAffineTransform(current_points[[0, 1, 2]], template_points[[0, 1, 2]]) # 取前三个点
-                 if M is None:
-                     self.progress_signal.emit(0, "校正失败: getAffineTransform 也无法计算变换矩阵M")
-                     return None
-             except Exception as e_get_affine:
-                 self.progress_signal.emit(0, f"校正失败: getAffineTransform 发生错误: {e_get_affine}")
-                 return None
-             # --- 结束尝试 ---
+        rows, cols = self.template_image_for_alignment.shape[:2] 
+        aligned_image_pass1 = cv2.warpAffine(image, M_initial, (cols, rows), 
+                                             flags=cv2.INTER_LINEAR,
+                                             borderMode=cv2.BORDER_CONSTANT, 
+                                             borderValue=(0, 0, 0))
+        
+        if self.debug:
+            cv2.imwrite(os.path.join(self.output_dir, "校正图_Pass1_Mark点.png"), aligned_image_pass1)
 
+        # === 第 2 步: ECC 精细校正 ===
+        try:
+            # 将第一次校正的结果转为灰度图
+            aligned_gray_pass1 = cv2.cvtColor(aligned_image_pass1, cv2.COLOR_BGR2GRAY)
+            
+            # 定义 ECC 参数
+            # 使用 MOTION_AFFINE (6自由度)，因为它速度快且通常足够
+            motion_type = cv2.MOTION_AFFINE 
+            # 定义一个初始的"什么都不做"的变换矩阵 (2x3 Affine)
+            warp_matrix_ecc = np.eye(2, 3, dtype=np.float32)
+            
+            # 设置迭代停止条件 (迭代500次或精度达到1e-5)
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 500, 1e-5)
+            
+            # 运行 ECC
+            # 目标: self.template_gray_for_alignment (模板)
+            # 输入: aligned_gray_pass1 (待对齐)
+            # ECC 会找到一个 warp_matrix_ecc，当它作用于 aligned_gray_pass1 时，使其最像 template_gray
+            (cc, warp_matrix_ecc) = cv2.findTransformECC(
+                self.template_gray_for_alignment, 
+                aligned_gray_pass1, 
+                warp_matrix_ecc, 
+                motion_type, 
+                criteria,
+                inputMask=None, # 不使用掩码
+                gaussFiltSize=3  # 使用 3x3 高斯模糊以提高稳定性
+            )
 
-        rows, cols = image.shape[:2]
-        # --- 使用不同的插值和边界处理方式 ---
-        aligned_image = cv2.warpAffine(image, M, (cols, rows),
-                                       flags=cv2.INTER_CUBIC, # 三次插值
-                                       borderMode=cv2.BORDER_REPLICATE) # 复制边界像素
-        return aligned_image
-    # --- 结束新增 ---
+            print(f"Pass 2 (ECC) 精细校正匹配度: {cc:.4f}")
+
+            # ECC 返回的 cc 是相关系数，越高越好。如果太低，说明对齐失败。
+            if cc < 0.8: # 这个阈值可能需要根据实际情况调整
+                self.progress_signal.emit(0, f"校正警告(Pass 2): ECC匹配度低 ({cc:.4f})，仅使用Mark点结果")
+                return aligned_image_pass1 # 返回第一步的结果
+
+            # 应用 ECC 找到的精细变换
+            # 注意: ECC 找到的矩阵 M 使得 T(x,y) ~ I(M(x,y))
+            # warpAffine 需要的 M 是 I -> T 的映射
+            # findTransformECC 返回的 M 是 T -> I 的映射 (template -> input)
+            # 我们需要使用 WARP_INVERSE_MAP 标志来应用这个反向映射
+            
+            final_aligned_image = cv2.warpAffine(
+                aligned_image_pass1, 
+                warp_matrix_ecc, 
+                (cols, rows), 
+                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP, # 关键：应用反向变换
+                borderMode=cv2.BORDER_CONSTANT, 
+                borderValue=(0, 0, 0)
+            )
+            
+            return final_aligned_image
+
+        except Exception as e_ecc:
+            self.progress_signal.emit(0, f"校正失败(Pass 2): ECC 步骤出错: {e_ecc}")
+            traceback.print_exc()
+            # ECC 失败时，仍然返回第一步的粗校正结果
+            return aligned_image_pass1
+    # --- 结束替换 ---
+
 
     def _scan_and_process(self):
         """扫描监控目录，处理新文件，返回本次成功处理的文件数"""
@@ -226,6 +300,13 @@ class DetectionThread(QThread):
                 for file_path in new_files:
                     if not self._is_running: return processed_count_in_scan # 中断时返回当前计数
                     self.progress_signal.emit(0, f"处理新文件: {os.path.basename(file_path)}")
+                    
+                    # --- 改进的文件锁定检查 ---
+                    if not self.is_file_ready(file_path):
+                        self.progress_signal.emit(0, f"文件 {os.path.basename(file_path)} 尚在写入中，跳过此次")
+                        continue # 跳过此文件，下次扫描再试
+                    # --- 结束 ---
+
                     success = self._process_single_image(file_path)
                     if success:
                         # self.processed_files.add(file_path) # 移到 _process_single_image 内部
@@ -245,6 +326,29 @@ class DetectionThread(QThread):
             traceback.print_exc()
             time.sleep(self.monitor_interval)
         return processed_count_in_scan # 返回本次处理的数量
+
+    def is_file_ready(self, file_path):
+        """检查文件是否已写入完毕 (通过检查文件大小是否变化)"""
+        try:
+            if not os.path.exists(file_path):
+                return False
+                
+            size_now = os.path.getsize(file_path)
+            time.sleep(0.1) # 等待 100ms
+            size_later = os.path.getsize(file_path)
+            
+            if size_now == size_later:
+                # 尝试以写入模式打开，检查是否被锁定
+                try:
+                    with open(file_path, 'a'):
+                        pass
+                except IOError:
+                    return False # 文件被锁定
+                return True # 大小未变且未锁定
+            else:
+                return False # 文件大小仍在变化
+        except Exception:
+            return False # 访问文件时出错
 
     def stop(self):
         self._is_running = False
@@ -292,12 +396,35 @@ class DetectionThread(QThread):
         os.makedirs(temp_dir, exist_ok=True)
         self.combined_binary_template, self.combined_rgb_binary_template = None, None
         self.template_min, self.template_max = None, None
+        
+        # --- 确保模板图至少有一个 ---
+        if not self.detector.template_paths:
+            self.progress_signal.emit(0, "错误: 模板路径列表为空，无法预处理。")
+            return
+            
+        first_template_shape = None
 
         for i, template_path in enumerate(self.detector.template_paths):
             template_gray = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
-            if template_gray is None: continue
+            if template_gray is None: 
+                self.progress_signal.emit(0, f"警告: 无法加载模板 {template_path}")
+                continue
             template_rgb = cv2.imread(template_path)
-            if template_rgb is None: continue
+            if template_rgb is None: 
+                self.progress_signal.emit(0, f"警告: 无法加载模板 {template_path}")
+                continue
+                
+            # --- 检查所有模板尺寸是否一致 ---
+            if first_template_shape is None:
+                first_template_shape = template_gray.shape
+            elif template_gray.shape != first_template_shape:
+                self.progress_signal.emit(0, f"错误: 模板 {template_path} 尺寸 {template_gray.shape} 与第一张模板 {first_template_shape} 不一致。")
+                self.progress_signal.emit(0, "所有模板必须尺寸相同。")
+                # 清理已处理的变量，防止使用不完整的数据
+                self.template_min, self.template_max = None, None
+                self.combined_binary_template, self.combined_rgb_binary_template = None, None
+                return
+            # --- 结束检查 ---
 
             if self.threshold_conditions.get("灰度差阈值"):
                 if self.template_min is None: self.template_min, self.template_max = template_gray.copy(), template_gray.copy()
@@ -332,20 +459,22 @@ class DetectionThread(QThread):
         basename = os.path.splitext(os.path.basename(image_path))[0]
         # 使用 re.sub 清理文件名中的非法字符
         safe_basename = re.sub(r'[\\/*?:"<>|]', '_', basename)
-        output_dir = os.path.join(self.output_dir, f"结果_{safe_basename}")
+        # --- 修改: 确保 output_dir 基于 self.output_dir ---
+        current_image_output_dir = os.path.join(self.output_dir, f"结果_{safe_basename}")
 
         # 使用 try...finally 确保清理
         image, image_gray, combined_mask, result_img, filtered_diff_img, original_image_for_cropping = [None] * 6
         try:
-            if os.path.exists(output_dir): shutil.rmtree(output_dir)
-            os.makedirs(output_dir, exist_ok=True)
+            # --- 修改: 使用 current_image_output_dir ---
+            if os.path.exists(current_image_output_dir): shutil.rmtree(current_image_output_dir)
+            os.makedirs(current_image_output_dir, exist_ok=True)
 
             try:
-                shutil.copy2(image_path, os.path.join(output_dir, "tested_image.jpg"))
+                shutil.copy2(image_path, os.path.join(current_image_output_dir, "tested_image.jpg"))
             except IOError as e:
                 self.progress_signal.emit(0, f"无法复制文件 (IOError): {e}")
                 time.sleep(0.5)
-                try: shutil.copy2(image_path, os.path.join(output_dir, "tested_image.jpg"))
+                try: shutil.copy2(image_path, os.path.join(current_image_output_dir, "tested_image.jpg"))
                 except Exception as e2: self.progress_signal.emit(0, f"复制文件最终失败: {e2}"); return False
             except Exception as e:
                  self.progress_signal.emit(0, f"复制文件时发生未知错误: {e}"); return False
@@ -361,11 +490,11 @@ class DetectionThread(QThread):
                     self.progress_signal.emit(0, f"校正失败，跳过: {basename}")
                     return False # 校正失败算处理失败
                 image = aligned_img # 使用校正后的图像
-                if self.debug: cv2.imwrite(os.path.join(output_dir, "校正后的图像.png"), image)
+                if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "校正后的图像.png"), image)
             # --- 结束校正 ---
 
             image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            if self.debug: cv2.imwrite(os.path.join(output_dir, "灰度图.png"), image_gray)
+            if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "灰度图.png"), image_gray)
 
             binary_masks = []
             t_start = time.time()
@@ -376,10 +505,10 @@ class DetectionThread(QThread):
                 if image_gray.shape == self.combined_binary_template.shape:
                     mask = np.zeros_like(image_gray)
                     for low, high in self.threshold_conditions["二值化阈值"]: mask = cv2.bitwise_or(mask, cv2.inRange(image_gray, low, high))
-                    if self.debug: cv2.imwrite(os.path.join(output_dir, "二值化_合并结果.png"), mask)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "二值化_合并结果.png"), mask)
                     diff = cv2.absdiff(mask, self.combined_binary_template)
                     diff_bin = cv2.bitwise_and(diff, mask)
-                    if self.debug: cv2.imwrite(os.path.join(output_dir, "二值化差异图.png"), diff_bin)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "二值化差异图.png"), diff_bin)
                     binary_masks.append(diff_bin)
                 else: print(f"警告: 二值化 - 尺寸不匹配 ({image_gray.shape} vs {self.combined_binary_template.shape}), 跳过。")
             # RGB二值化
@@ -393,10 +522,10 @@ class DetectionThread(QThread):
                     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
                     k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
                     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
-                    if self.debug: cv2.imwrite(os.path.join(output_dir, "RGB二值化_合并结果.png"), mask)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "RGB二值化_合并结果.png"), mask)
                     diff = cv2.absdiff(mask, self.combined_rgb_binary_template)
                     diff_rgb = cv2.bitwise_and(diff, mask)
-                    if self.debug: cv2.imwrite(os.path.join(output_dir, "RGB差异图.png"), diff_rgb)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "RGB差异图.png"), diff_rgb)
                     binary_masks.append(diff_rgb)
                 else: print(f"警告: RGB二值化 - 尺寸不匹配 ({image.shape[:2]} vs {self.combined_rgb_binary_template.shape}), 跳过。")
             # 灰度差
@@ -410,10 +539,10 @@ class DetectionThread(QThread):
                         low = np.clip(self.template_min.astype(np.int16) - thresh, 0, 255).astype(np.uint8)
                         high = np.clip(self.template_max.astype(np.int16) + thresh, 0, 255).astype(np.uint8)
                         if self.debug:
-                            cv2.imwrite(os.path.join(output_dir, "灰度差_下限图.png"), low)
-                            cv2.imwrite(os.path.join(output_dir, "灰度差_上限图.png"), high)
+                            cv2.imwrite(os.path.join(current_image_output_dir, "灰度差_下限图.png"), low)
+                            cv2.imwrite(os.path.join(current_image_output_dir, "灰度差_上限图.png"), high)
                         diff_gray = cv2.bitwise_or(cv2.compare(image_gray, low, cv2.CMP_LT), cv2.compare(image_gray, high, cv2.CMP_GT))
-                    if self.debug: cv2.imwrite(os.path.join(output_dir, "灰度差_差异图.png"), diff_gray)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "灰度差_差异图.png"), diff_gray)
                     binary_masks.append(diff_gray)
                 else: print(f"警告: 灰度差 - 尺寸不匹配 ({image_gray.shape} vs {self.template_min.shape}), 跳过。")
 
@@ -426,7 +555,7 @@ class DetectionThread(QThread):
                 op = cv2.bitwise_and if self.combo_method == "and" else cv2.bitwise_or
                 for i in range(1, len(binary_masks)): combined_mask = op(combined_mask, binary_masks[i])
             # 总是保存差异总图 (Debug模式)
-            if self.debug: cv2.imwrite(os.path.join(output_dir, "差异总图.png"), combined_mask)
+            if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "差异总图.png"), combined_mask)
 
             # --- 应用屏蔽罩 ---
             mask_path = os.path.join("config", "mask.png")
@@ -437,7 +566,7 @@ class DetectionThread(QThread):
                         print(f"警告: 屏蔽罩尺寸({mask_img.shape})与图像({combined_mask.shape})不匹配,将缩放.")
                         mask_img = cv2.resize(mask_img, (combined_mask.shape[1], combined_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
                     combined_mask = cv2.bitwise_and(combined_mask, mask_img)
-                    if self.debug: cv2.imwrite(os.path.join(output_dir, "差异总图(带屏蔽).png"), combined_mask)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "差异总图(带屏蔽).png"), combined_mask)
 
             t1_preprocessing_done = time.time()
 
@@ -528,19 +657,20 @@ class DetectionThread(QThread):
 
             # 保存 Debug 图片
             if self.debug:
-                cv2.imwrite(os.path.join(output_dir, "过滤后的差异图.png"), filtered_diff_img)
-                cv2.imwrite(os.path.join(output_dir, "final_result.png"), result_img)
+                cv2.imwrite(os.path.join(current_image_output_dir, "过滤后的差异图.png"), filtered_diff_img)
+                cv2.imwrite(os.path.join(current_image_output_dir, "final_result.png"), result_img)
 
             t2_filtering_done = time.time()
 
             # --- 缺陷裁剪与保存 ---
             if defect_regions:
-                original_image_for_cropping = cv2.imread(image_path)
-                if original_image_for_cropping is None:
-                    self.progress_signal.emit(0, f"错误: 重新加载原始图像失败 {image_path}"); return False
+                # --- 修正: 缺陷裁剪应该使用校正后的图像 (image) ---
+                # 因为 (x,y,w,h,cx,cy) 都是在校正后的图像上计算的
+                original_image_for_cropping = image
+                # --- 结束 ---
 
                 t3_reload_done = time.time()
-                defects_dir = os.path.join(output_dir, "defects")
+                defects_dir = os.path.join(current_image_output_dir, "defects")
                 os.makedirs(defects_dir, exist_ok=True)
 
                 tasks = []
@@ -578,7 +708,7 @@ class DetectionThread(QThread):
                 print(f"\n--- 性能分析 ({basename}) ---")
                 print(f"预处理与掩码: {t1_preprocessing_done - t_start:.4f} s")
                 print(f"连通域与过滤: {t2_filtering_done - t1_preprocessing_done:.4f} s")
-                print(f"重载原图: {t3_reload_done - t2_filtering_done:.4f} s")
+                print(f"缺陷裁剪准备: {t3_reload_done - t2_filtering_done:.4f} s")
                 print(f"缺陷裁剪保存: {t4_crop_save_done - t3_reload_done:.4f} s")
                 print(f"--- 总计: {t4_crop_save_done - t_start:.4f} s ---")
 
@@ -599,8 +729,8 @@ class DetectionThread(QThread):
             traceback.print_exc()
             # 尝试记录错误日志
             try:
-                if 'output_dir' in locals() and os.path.exists(output_dir):
-                    error_file = os.path.join(output_dir, "error.log")
+                if 'current_image_output_dir' in locals() and os.path.exists(current_image_output_dir):
+                    error_file = os.path.join(current_image_output_dir, "error.log")
                     with open(error_file, 'w', encoding='utf-8') as f: # 指定编码
                         f.write(f"处理文件 {image_path} 时发生错误:\n")
                         f.write(str(process_error) + "\n\n")
