@@ -377,7 +377,7 @@ class CameraThread(QThread):
 
                 # --- 如果捕获了，则尝试保存并退出 ---
                 if capture_now and self.pDataForSaveImage:
-                    filename = f"capture_{int(time.time())}.png"
+                    filename = f"capture_{int(time.time())}.jpeg"
                     save_result = self._save_frame(filename)
                     if save_result:
                         save_path, width, height = save_result
