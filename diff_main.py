@@ -1,5 +1,5 @@
 # 文件名: diff_main.py
-# 描述: (已修改) 修复退出时的 AttributeError 竞态条件。
+# 描述: (已修改) 修复退出时的 AttributeError 竞态条件, 修改相机取图命名逻辑。
 
 import sys
 import cv2
@@ -7,7 +7,7 @@ import numpy as np
 import os
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime # <-- 新增导入
 from PyQt5.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout,
                             QPushButton, QFileDialog, QLabel, QCheckBox,
                             QMessageBox, QFrame, QLineEdit, QGroupBox,
@@ -70,7 +70,7 @@ class PcbDefectDetector(QWidget):
         self.current_cam_object = None
         self.hik_device_list = None
         self.capture_target_label = None # --- 新增: 记录目标Label ---
-        
+
         # --- 修改: 预览状态标志 ---
         self.is_camera_previewing = False # 标志线程是否在运行
         self.is_previewing_template = False # 标志模板标签是否在接收预览
@@ -96,7 +96,7 @@ class PcbDefectDetector(QWidget):
 
         self.initUI()
         self.load_settings()
-        
+
         # --- 新增: 启动后自动开始预览 ---
         self.start_initial_camera_feed()
         # --- 结束新增 ---
@@ -158,12 +158,12 @@ class PcbDefectDetector(QWidget):
         template_btn_layout.addWidget(self.btn_load_template)
         template_btn_layout.addWidget(self.btn_load_template_folder)
         template_btn_layout.addWidget(self.btn_cam_template)
-        
+
         self.btn_open_marker = QPushButton('设置校正Mark点')
         self.btn_open_marker.setStyleSheet("background-color: #FFC300; color: black;")
         self.btn_open_marker.clicked.connect(self.open_marker_tool)
         template_btn_layout.addWidget(self.btn_open_marker)
-        
+
         template_btn_layout.addWidget(self.btn_clear_template)
         template_layout.addLayout(template_btn_layout, stretch=1)
 
@@ -281,11 +281,11 @@ class PcbDefectDetector(QWidget):
         btn_layout_bottom.addWidget(self.cb_use_ai)
         btn_layout_bottom.addWidget(self.cb_debug)
         btn_layout_bottom.addWidget(self.cb_monitor_folder)
-        
+
         self.btn_set_output_dir = QPushButton('设置输出目录')
         self.btn_set_output_dir.clicked.connect(self.set_output_directory)
         btn_layout_bottom.addWidget(self.btn_set_output_dir)
-        
+
         btn_layout_bottom.addStretch(1)
 
         self.btn_detect = QPushButton('🔍 开始检测')
@@ -321,36 +321,36 @@ class PcbDefectDetector(QWidget):
             if not self.template_paths:
                 QMessageBox.warning(self, "请先加载模板", "请先在主界面加载一个“标准模板图”，Mark工具将自动使用该图。")
                 return
-            
+
             template_to_pass = self.template_paths[0]
 
             error_log_path = os.path.join(os.getcwd(), "mark_tool_error.log")
-            
+
             command_list = [sys.executable, mark_script_path, template_to_pass]
-            
+
             with open(error_log_path, 'w') as error_log:
                 proc = subprocess.Popen(
-                    command_list, 
-                    stderr=error_log, 
+                    command_list,
+                    stderr=error_log,
                     stdout=subprocess.DEVNULL
                 )
 
-            time.sleep(1) 
-            
+            time.sleep(1)
+
             if os.path.exists(error_log_path) and os.path.getsize(error_log_path) > 0:
                 with open(error_log_path, 'r') as f:
                     error_content = f.read()
-                QMessageBox.critical(self, "Mark工具启动失败", 
+                QMessageBox.critical(self, "Mark工具启动失败",
                     f"Mark点工具(mark.py)启动时遇到错误，界面可能无法弹出。\n\n"
                     f"请检查环境是否缺少库 (如 'Pillow' 或 'imutils')。\n\n"
-                    f"错误详情 (已保存到 {error_log_path}):\n{error_content[:500]}...") 
-                return 
+                    f"错误详情 (已保存到 {error_log_path}):\n{error_content[:500]}...")
+                return
 
             print(f"Mark点工具已启动 (自动加载: {os.path.basename(template_to_pass)})。")
-                
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法打开Mark点工具: {e}\n{traceback.format_exc()}")
-    
+
     # --- 新增: 启动唯一的相机预览线程 ---
     def start_initial_camera_feed(self):
         """启动后自动调用，开启一个相机线程，将画面推送到两个标签。"""
@@ -362,7 +362,7 @@ class PcbDefectDetector(QWidget):
 
         if self.camera_thread and self.camera_thread.isRunning():
             return # 已经在运行
-            
+
         try:
             devices, self.hik_device_list = self.camera_manager.list_devices()
             if not devices or not self.hik_device_list:
@@ -393,12 +393,12 @@ class PcbDefectDetector(QWidget):
             self.camera_thread.error_signal.connect(self.on_camera_error)
 
             self.camera_thread.start()
-            
+
             # 设置状态标志
             self.is_camera_previewing = True # 线程在运行
             self.is_previewing_template = True # 模板侧在接收
             self.is_previewing_image = True # 结果侧在接收
-            
+
             # 启用按钮
             self.btn_cam_template.setEnabled(True)
             self.btn_cam_image.setEnabled(True)
@@ -418,7 +418,7 @@ class PcbDefectDetector(QWidget):
             self.camera_thread.request_capture() # 请求捕获
             self.btn_cam_template.setText("采集中...")
             self.btn_cam_template.setEnabled(False)
-        
+
     def request_capture_image(self):
         """结果侧按钮点击：请求捕获"""
         if self.camera_thread and self.camera_thread.isRunning() and self.is_previewing_image:
@@ -433,7 +433,7 @@ class PcbDefectDetector(QWidget):
         """更新所有仍在“预览模式”的标签"""
         if not self.is_camera_previewing:
             return
-            
+
         try:
             h, w, ch = img_bgr.shape
             if h > 0 and w > 0:
@@ -441,11 +441,11 @@ class PcbDefectDetector(QWidget):
                 # 注意 QImage 使用 BGR 数据
                 q_img = QImage(img_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
                 pixmap = QPixmap.fromImage(q_img)
-                
+
                 # 如果模板侧在预览，则更新
                 if self.is_previewing_template:
                     self.template_label.setPixmap(pixmap)
-                
+
                 # 如果结果侧在预览，则更新
                 if self.is_previewing_image:
                     self.result_label.setPixmap(pixmap)
@@ -474,16 +474,16 @@ class PcbDefectDetector(QWidget):
         self.stop_camera_feed() # 发生错误时停止
 
     # --- 修改: 捕获回调，用于固定画面 ---
-    @pyqtSlot(np.ndarray) 
+    @pyqtSlot(np.ndarray)
     def on_frame_captured(self, captured_image_bgr):
         """相机成功捕获一帧并保存后调用"""
         print(f"帧已捕获! 内存中尺寸: {captured_image_bgr.shape}")
-        
+
         try:
             h, w, ch = captured_image_bgr.shape
             if h <= 0 or w <= 0:
                 raise Exception("捕获的图像尺寸无效")
-            
+
             bytes_per_line = ch * w
             q_img = QImage(captured_image_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
             pixmap = QPixmap.fromImage(q_img)
@@ -494,16 +494,22 @@ class PcbDefectDetector(QWidget):
             # 保存图像
             temp_dir = os.path.join("output", "temp_captures")
             os.makedirs(temp_dir, exist_ok=True)
-            filename = f"capture_{int(time.time())}.jpeg" 
+
+            # --- [修改] 使用时间命名 ---
+            # 获取当前时间并格式化为 YYYYMMDD_HHMMSS
+            current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{current_time_str}.jpeg" # <-- 修改文件名格式
+            # --- [结束修改] ---
+
             save_path = os.path.join(temp_dir, filename)
-            
+
             try:
                 cv2.imwrite(save_path, captured_image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 print(f"捕获的帧已保存至: {save_path}")
             except Exception as e_save:
                 print(f"警告: cv2.imwrite (JPEG) 保存失败: {e_save}")
                 save_path = None
-            
+
             if save_path is None:
                 raise Exception("无法将捕获的图像保存到磁盘")
 
@@ -515,6 +521,10 @@ class PcbDefectDetector(QWidget):
                 self.template_label.setPixmap(pixmap) # 固定画面
                 self.btn_load_template.setText(f"已加载: {os.path.basename(save_path)}")
                 self.btn_load_template_folder.setText("加载模板文件夹")
+                # 重新启用按钮，允许用户再次取图
+                self.btn_cam_template.setEnabled(True)
+                self.btn_cam_template.setText("点击取图")
+
 
             elif self.capture_target_label == self.result_label:
                 self.is_previewing_image = False # <-- 停止预览
@@ -529,10 +539,13 @@ class PcbDefectDetector(QWidget):
                 self.cb_monitor_folder.setChecked(False)
 
                 print("相机取图（检测图）完成，自动触发检测...")
+                # 重新启用按钮，允许用户再次取图
+                self.btn_cam_image.setEnabled(True)
+                self.btn_cam_image.setText("点击取图")
                 self.start_detection() # 自动检测
             else:
                  print("警告: 捕获目标未知!")
-            
+
             self.capture_target_label = None # 清空目标
 
         except Exception as e:
@@ -591,12 +604,12 @@ class PcbDefectDetector(QWidget):
         self.template_label.setText("相机预览中...") # 恢复提示
         self.btn_load_template.setText('加载单模板图')
         self.btn_load_template_folder.setText('加载模板文件夹')
-        
+
         # --- 恢复预览 ---
         self.is_previewing_template = True
         self.btn_cam_template.setEnabled(True)
         self.btn_cam_template.setText("点击取图")
-        
+
         # 如果相机线程已停止，尝试重启
         if not self.camera_thread or not self.camera_thread.isRunning():
             self.start_initial_camera_feed()
@@ -614,12 +627,12 @@ class PcbDefectDetector(QWidget):
         self.progress_label.setText("就绪")
         self.cb_monitor_folder.setEnabled(False)
         self.cb_monitor_folder.setChecked(False)
-        
+
         # --- 恢复预览 ---
         self.is_previewing_image = True
         self.btn_cam_image.setEnabled(True)
         self.btn_cam_image.setText("点击取图")
-        
+
         # 如果相机线程已停止，尝试重启
         if not self.camera_thread or not self.camera_thread.isRunning():
             self.start_initial_camera_feed()
@@ -696,7 +709,7 @@ class PcbDefectDetector(QWidget):
                 print("未找到设置文件，正在创建默认设置...")
                 self.create_default_ultralytics_settings()
                 return False
-                
+
             with open('config/settings.json', 'r', encoding='utf-8') as f:
                 settings = json.load(f)
 
@@ -748,10 +761,10 @@ class PcbDefectDetector(QWidget):
             self.cb_debug.setChecked(settings.get('debug', False))
             self.cb_monitor_folder.setChecked(settings.get('monitor_folder', False))
             self.cb_auto_delete.setChecked(settings.get('auto_delete', False))
-            
+
             default_output_dir = os.path.join(os.getcwd(), "output")
             self.current_output_dir = settings.get('output_dir', default_output_dir)
-            
+
             self.cb_use_alignment.setChecked(settings.get('use_alignment', False))
 
             return True
@@ -792,7 +805,7 @@ class PcbDefectDetector(QWidget):
     def load_template(self):
         self.is_previewing_template = False # 停止预览
         self.btn_cam_template.setEnabled(False) # 禁用按钮
-        
+
         path, _ = QFileDialog.getOpenFileName(self, "选择模板图", "", "图片文件 (*.png *.jpg *.jpeg)")
         if path:
             self.template_paths = [path]
@@ -807,7 +820,7 @@ class PcbDefectDetector(QWidget):
     def load_template_folder(self):
         self.is_previewing_template = False # 停止预览
         self.btn_cam_template.setEnabled(False) # 禁用按钮
-        
+
         folder = QFileDialog.getExistingDirectory(self, "选择模板图文件夹", "")
         if folder:
             template_paths = []
@@ -829,7 +842,7 @@ class PcbDefectDetector(QWidget):
     def load_image(self):
         self.is_previewing_image = False # 停止预览
         self.btn_cam_image.setEnabled(False) # 禁用按钮
-        
+
         path, _ = QFileDialog.getOpenFileName(self, "选择检测图", "", "图片文件 (*.png *.jpg *.jpeg)")
         if path:
             self.image_path = path
@@ -849,7 +862,7 @@ class PcbDefectDetector(QWidget):
     def load_image_folder(self):
         self.is_previewing_image = False # 停止预览
         self.btn_cam_image.setEnabled(False) # 禁用按钮
-        
+
         self.folder = QFileDialog.getExistingDirectory(self, "选择检测图片文件夹", "")
         if self.folder:
             self.image_paths = []
@@ -921,7 +934,7 @@ class PcbDefectDetector(QWidget):
                  # request_capture_image 会在回调 (on_frame_captured) 中
                  # 自动调用 self.start_detection()
                  # 所以我们应该在这里返回，防止双重调用
-                 return 
+                 return
              else:
                  QMessageBox.warning(self, "错误", "相机预览已停止，无法自动取图检测")
                  return
@@ -954,7 +967,7 @@ class PcbDefectDetector(QWidget):
             use_ai = self.cb_use_ai.isChecked()
             combo_method = "and" if self.radio_and.isChecked() else "or"
             debug = self.cb_debug.isChecked()
-            
+
             use_alignment = self.cb_use_alignment.isChecked()
 
             self.detection_thread = DetectionThread(
@@ -976,7 +989,7 @@ class PcbDefectDetector(QWidget):
             self.btn_detect.setEnabled(False)
             self.btn_stop.setEnabled(True)
             self.btn_view_defects.setEnabled(False)
-            self.cb_monitor_folder.setEnabled(False) 
+            self.cb_monitor_folder.setEnabled(False)
 
             if monitoring_mode:
                 self.progress_bar.setMaximum(0) # 不定进度条
@@ -1095,7 +1108,7 @@ class PcbDefectDetector(QWidget):
         output_dir = self.current_output_dir
         if not output_dir or not os.path.exists(output_dir):
             output_dir = "output" # 备用路径
-            
+
         viewer = DefectViewer(parent=self, output_dir=output_dir)
         viewer.exec_()
 

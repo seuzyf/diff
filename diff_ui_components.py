@@ -51,8 +51,14 @@ class ZoomableLabel(QLabel):
             final_x = pixmap_rect.x() + scaled_cx
             final_y = pixmap_rect.y() + scaled_cy
             painter.setPen(QPen(Qt.red, 2))
-            painter.drawLine(final_x - 10, final_y, final_x + 10, final_y)
-            painter.drawLine(final_x, final_y - 10, final_x, final_y + 10)
+            
+            # --- 修改: 使十字线贯穿整个视图 ---
+            view_rect = self.rect() # 获取整个控件的矩形
+            # 绘制水平线 (贯穿)
+            painter.drawLine(view_rect.left(), final_y, view_rect.right(), final_y)
+            # 绘制垂直线 (贯穿)
+            painter.drawLine(final_x, view_rect.top(), final_x, view_rect.bottom())
+            # --- 结束修改 ---
         
         painter.end()
     

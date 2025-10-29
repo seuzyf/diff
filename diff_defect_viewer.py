@@ -1,5 +1,5 @@
 # 文件名: diff_defect_viewer.py
-# 描述: (已回退) 移除了模板对比框。
+# 描述: (已修改) 允许窗口缩放并添加最大化/最小化按钮，并默认最大化打开。
 
 import os
 import re
@@ -19,7 +19,16 @@ class DefectViewer(QDialog):
     def __init__(self, parent=None, output_dir=None):
         super().__init__(parent)
         self.setWindowTitle("缺陷查看器 (快捷键: ↑/↓切换, →标记误报)")
-        # --- 恢复原始尺寸 ---
+        
+        # --- 新增: 设置窗口标志，允许最大化和调整大小 ---
+        self.setWindowFlags(
+            self.windowFlags() | 
+            Qt.WindowMaximizeButtonHint | 
+            Qt.WindowMinimizeButtonHint
+        ) #
+        # --- 结束新增 ---
+        
+        # --- 恢复原始尺寸 (作为初始尺寸) ---
         self.resize(1600, 700)
         self.output_dir = output_dir
         self.defect_files = []
@@ -33,6 +42,13 @@ class DefectViewer(QDialog):
         # --- 移除 template_img ---
         # self.template_img = None
         self.initUI()
+        
+        if self.output_dir:
+            self.load_result_dirs(self.output_dir)
+            
+        # --- 新增: 默认最大化打开 ---
+        self.showMaximized()
+        # --- 结束新增 ---
 
     def initUI(self):
         layout = QHBoxLayout(self)
@@ -151,8 +167,9 @@ class DefectViewer(QDialog):
 
         layout.addWidget(right_widget, stretch=1)
 
-        if self.output_dir:
-            self.load_result_dirs(self.output_dir)
+        # --- 移除: 已移动到 __init__ 末尾 ---
+        # if self.output_dir:
+        #     self.load_result_dirs(self.output_dir)
 
     def keyPressEvent(self, event):
         """重写键盘事件，添加快捷键支持"""

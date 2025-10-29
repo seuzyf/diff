@@ -11,6 +11,31 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from glob import glob
 import re # <-- 添加缺失的 import
 
+# --- 新增: API上传所需的库 ---
+import requests
+import io
+import threading # <-- 新增: 用于后台上传
+# --- 结束新增 ---
+
+
+# --- 新增: 转换OpenCV图像到内存字节流的辅助函数 ---
+def mat_to_bytes_io(image, ext='.jpg', quality=95):
+    """
+    Converts an OpenCV image (NumPy array) to an in-memory byte stream (io.BytesIO).
+    """
+    try:
+        # 编码为JPEG格式
+        is_success, buffer = cv2.imencode(ext, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not is_success:
+            raise Exception("cv2.imencode failed")
+        # 创建内存中的字节流
+        return io.BytesIO(buffer)
+    except Exception as e:
+        print(f"Error converting image to bytes: {e}")
+        return None
+# --- 结束新增 ---
+
+
 class DetectionThread(QThread):
     progress_signal = pyqtSignal(int, str)  # 进度值, 消息
     finished_signal = pyqtSignal(bool, str)  # 是否成功, 消息
@@ -40,6 +65,7 @@ class DetectionThread(QThread):
         self.use_alignment = use_alignment # <-- 接收参数值
         self.align_template_rois = []
         self.align_template_centers = []
+        self.align_template_rects = [] # <-- 新增: Mark点矩形框
         self.template_image_for_alignment = None # <-- 新增: 用于存储模板图
         self.template_gray_for_alignment = None # <-- 新增: 用于存储灰度模板图
         # --- 结束新增 ---
@@ -128,8 +154,16 @@ class DetectionThread(QThread):
                 config = json.load(f)
 
             self.align_template_centers = config.get('centers')
+            self.align_template_rects = config.get('rects') # <-- 新增: 加载矩形框
+            
             if not self.align_template_centers or len(self.align_template_centers) != 3:
                 raise ValueError("marks.json中'centers'配置无效或数量不为3")
+            
+            # --- 新增检查 ---
+            if not self.align_template_rects or len(self.align_template_rects) != 3:
+                raise ValueError("marks.json中'rects'配置无效或数量不为3 (请使用最新mark.py重新保存)")
+            # --- 结束新增 ---
+
 
             self.align_template_rois = []
             for i in range(1, 4):
@@ -149,7 +183,7 @@ class DetectionThread(QThread):
             return False
     # --- 结束新增 ---
 
-    # --- 替换: 图像校正方法 (使用 Mark点 + ECC 的两步混合校正) ---
+    # --- 替换: 图像校正方法 (移除 ECC, 只保留 Mark点校正) ---
     def align_image(self, image):
         # 检查 Mark ROIs 和模板图是否已加载
         if not self.align_template_rois or len(self.align_template_rois) != 3:
@@ -219,64 +253,49 @@ class DetectionThread(QThread):
         if self.debug:
             cv2.imwrite(os.path.join(self.output_dir, "校正图_Pass1_Mark点.png"), aligned_image_pass1)
 
-        # === 第 2 步: ECC 精细校正 ===
-        try:
-            # 将第一次校正的结果转为灰度图
-            aligned_gray_pass1 = cv2.cvtColor(aligned_image_pass1, cv2.COLOR_BGR2GRAY)
-            
-            # 定义 ECC 参数
-            # 使用 MOTION_AFFINE (6自由度)，因为它速度快且通常足够
-            motion_type = cv2.MOTION_AFFINE 
-            # 定义一个初始的"什么都不做"的变换矩阵 (2x3 Affine)
-            warp_matrix_ecc = np.eye(2, 3, dtype=np.float32)
-            
-            # 设置迭代停止条件 (迭代500次或精度达到1e-5)
-            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 500, 1e-5)
-            
-            # 运行 ECC
-            # 目标: self.template_gray_for_alignment (模板)
-            # 输入: aligned_gray_pass1 (待对齐)
-            # ECC 会找到一个 warp_matrix_ecc，当它作用于 aligned_gray_pass1 时，使其最像 template_gray
-            (cc, warp_matrix_ecc) = cv2.findTransformECC(
-                self.template_gray_for_alignment, 
-                aligned_gray_pass1, 
-                warp_matrix_ecc, 
-                motion_type, 
-                criteria,
-                inputMask=None, # 不使用掩码
-                gaussFiltSize=3  # 使用 3x3 高斯模糊以提高稳定性
-            )
-
-            print(f"Pass 2 (ECC) 精细校正匹配度: {cc:.4f}")
-
-            # ECC 返回的 cc 是相关系数，越高越好。如果太低，说明对齐失败。
-            if cc < 0.8: # 这个阈值可能需要根据实际情况调整
-                self.progress_signal.emit(0, f"校正警告(Pass 2): ECC匹配度低 ({cc:.4f})，仅使用Mark点结果")
-                return aligned_image_pass1 # 返回第一步的结果
-
-            # 应用 ECC 找到的精细变换
-            # 注意: ECC 找到的矩阵 M 使得 T(x,y) ~ I(M(x,y))
-            # warpAffine 需要的 M 是 I -> T 的映射
-            # findTransformECC 返回的 M 是 T -> I 的映射 (template -> input)
-            # 我们需要使用 WARP_INVERSE_MAP 标志来应用这个反向映射
-            
-            final_aligned_image = cv2.warpAffine(
-                aligned_image_pass1, 
-                warp_matrix_ecc, 
-                (cols, rows), 
-                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP, # 关键：应用反向变换
-                borderMode=cv2.BORDER_CONSTANT, 
-                borderValue=(0, 0, 0)
-            )
-            
-            return final_aligned_image
-
-        except Exception as e_ecc:
-            self.progress_signal.emit(0, f"校正失败(Pass 2): ECC 步骤出错: {e_ecc}")
-            traceback.print_exc()
-            # ECC 失败时，仍然返回第一步的粗校正结果
-            return aligned_image_pass1
+        # === 第 2 步: ECC 精细校正 (已根据用户请求移除) ===
+        
+        return aligned_image_pass1 # <-- 直接返回Pass 1的结果
     # --- 结束替换 ---
+
+    # --- [新增] API上传的后台辅助方法 ---
+    def _upload_image_in_background(self, image_to_upload, basename):
+        """
+        在单独的线程中运行，用于上传图像，不阻塞主检测线程。
+        """
+        try:
+            # 此函数在单独的线程中运行。
+            print(f"后台上传中: {basename}...")
+            
+            image_bytes_io = mat_to_bytes_io(image_to_upload) 
+            
+            if image_bytes_io:
+                url = "http://fod-train.hissit.huawei.com:8083/api/ml-predict/detect-online/detect/"
+                payload = {}
+                # 使用原始basename (无扩展名) + .jpg 作为文件名
+                files = [
+                    ('image', (f'{basename}.jpg', image_bytes_io, 'image/jpeg'))
+                ]
+                headers = {}
+
+                # 设置10秒超时
+                response = requests.request("POST", url, headers=headers, data=payload, files=files, timeout=10)
+                
+                if response.status_code == 200:
+                    print(f"后台上传成功: {basename}. 响应: {response.text[:100]}...")
+                else:
+                    print(f"后台上传失败: {basename}. 状态码: {response.status_code}, 响应: {response.text}")
+            else:
+                print(f"后台上传: 无法转换 {basename} 为字节, 跳过.")
+
+        except requests.exceptions.RequestException as e_req:
+            # 处理网络相关的错误 (如连接超时, DNS错误)
+            print(f"后台上传 {basename} 时出错 (RequestException): {e_req}")
+        except Exception as e_api:
+            # 处理其他所有错误
+            print(f"后台上传 {basename} 时发生未知错误: {e_api}")
+            traceback.print_exc()
+    # --- [结束新增] ---
 
 
     def _scan_and_process(self):
@@ -470,6 +489,7 @@ class DetectionThread(QThread):
             os.makedirs(current_image_output_dir, exist_ok=True)
 
             try:
+                # 复制原图
                 shutil.copy2(image_path, os.path.join(current_image_output_dir, "tested_image.jpg"))
             except IOError as e:
                 self.progress_signal.emit(0, f"无法复制文件 (IOError): {e}")
@@ -491,6 +511,15 @@ class DetectionThread(QThread):
                     return False # 校正失败算处理失败
                 image = aligned_img # 使用校正后的图像
                 if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "校正后的图像.png"), image)
+                
+                # --- 新增: 覆盖 tested_image.jpg 为校正后的图像 ---
+                # 确保缺陷查看器加载的是校正后的图像
+                try:
+                    cv2.imwrite(os.path.join(current_image_output_dir, "tested_image.jpg"), image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                except Exception as e_save:
+                    self.progress_signal.emit(0, f"警告: 覆盖 tested_image.jpg 失败: {e_save}")
+                # --- 结束新增 ---
+                
             # --- 结束校正 ---
 
             image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -554,6 +583,35 @@ class DetectionThread(QThread):
                 combined_mask = binary_masks[0]
                 op = cv2.bitwise_and if self.combo_method == "and" else cv2.bitwise_or
                 for i in range(1, len(binary_masks)): combined_mask = op(combined_mask, binary_masks[i])
+            
+            # --- 新增: 应用Mark点最大外接矩形 ---
+            if self.use_alignment and self.align_template_rects:
+                try:
+                    all_rects = np.array(self.align_template_rects)
+                    # (x1, y1, x2, y2)
+                    min_x = np.min(all_rects[:, 0])
+                    min_y = np.min(all_rects[:, 1])
+                    max_x = np.max(all_rects[:, 2])
+                    max_y = np.max(all_rects[:, 3])
+                    
+                    # 增加一点 padding
+                    pad = 5 
+                    h, w = combined_mask.shape[:2]
+                    x1 = max(0, int(min_x - pad))
+                    y1 = max(0, int(min_y - pad))
+                    x2 = min(w, int(max_x + pad))
+                    y2 = min(h, int(max_y + pad))
+                    
+                    mark_bbox_mask = np.zeros_like(combined_mask)
+                    cv2.rectangle(mark_bbox_mask, (x1, y1), (x2, y2), 255, -1) # 255 = 白色, -1 = 填充
+                    
+                    combined_mask = cv2.bitwise_and(combined_mask, mark_bbox_mask)
+                    if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "差异图(Mark点BBox).png"), combined_mask)
+                    
+                except Exception as e_bbox:
+                    print(f"应用Mark BBox失败: {e_bbox}")
+            # --- 结束新增 ---
+
             # 总是保存差异总图 (Debug模式)
             if self.debug: cv2.imwrite(os.path.join(current_image_output_dir, "差异总图.png"), combined_mask)
 
@@ -719,6 +777,20 @@ class DetectionThread(QThread):
                  print(f"连通域与过滤: {t2_filtering_done - t1_preprocessing_done:.4f} s")
                  print(f"(无缺陷)")
                  print(f"--- 总计: {t4_crop_save_done - t_start:.4f} s ---")
+
+
+            # --- [修改] 发送图像到外部API (在后台线程中) ---
+            # 'image' 变量保存着已加载并（可能）校正后的图像
+            
+            # 传入 image.copy() 以避免主线程垃圾回收导致的问题
+            upload_thread = threading.Thread(
+                target=self._upload_image_in_background,
+                args=(image.copy(), basename) # 必须使用 .copy()
+            )
+            upload_thread.daemon = True # 设为守护线程，主程序退出时它也会退出
+            upload_thread.start()
+            # --- [结束修改] ---
+            
 
             # --- 成功处理后标记 ---
             self.processed_files.add(image_path)
