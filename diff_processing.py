@@ -263,24 +263,42 @@ class DetectionThread(QThread):
         """
         在单独的线程中运行，用于上传图像，不阻塞主检测线程。
         """
+        import os  # 确保导入 os 模块，如果没有的话
+
+        ref_image_path = "1.png"  # 固定参考图路径
+
         try:
             # 此函数在单独的线程中运行。
             print(f"后台上传中: {basename}...")
             
+            # 1. 将当前检测的 Mat 图片转换为 BytesIO
             image_bytes_io = mat_to_bytes_io(image_to_upload) 
             
             if image_bytes_io:
-                url = "http://fod-train.hissit.huawei.com:8083/api/ml-predict/detect-online/detect/"
+                url = "http://fod-train.hissit.huawei.com:8083/api/ml-predict/detect-online/preview/"
                 payload = {}
-                # 使用原始basename (无扩展名) + .jpg 作为文件名
-                files = [
-                    ('image', (f'{basename}.jpg', image_bytes_io, 'image/jpeg'))
-                ]
                 headers = {}
 
-                # 设置10秒超时
-                response = requests.request("POST", url, headers=headers, data=payload, files=files, timeout=10)
+                # 2. 检查本地参考图是否存在，避免报错
+                if not os.path.exists(ref_image_path):
+                    print(f"后台上传失败: 本地参考图 {ref_image_path} 不存在，请检查路径。")
+                    return
+
+                # 3. 打开本地参考图并发送请求
+                # 使用 with open 确保文件使用后自动关闭
+                with open(ref_image_path, 'rb') as f_ref:
+                    files = [
+                        # 参数名: (文件名, 文件对象, MIME类型)
+                        # image_ref 对应本地的 1.png
+                        ('image_ref', ('1.png', f_ref, 'image/png')),
+                        # image 对应内存中转换好的检测图
+                        ('image', (f'{basename}.jpg', image_bytes_io, 'image/jpeg'))
+                    ]
+
+                    # 设置10秒超时
+                    response = requests.request("POST", url, headers=headers, data=payload, files=files, timeout=1000)
                 
+                # 4. 处理响应
                 if response.status_code == 200:
                     print(f"后台上传成功: {basename}. 响应: {response.text[:100]}...")
                 else:
@@ -295,7 +313,6 @@ class DetectionThread(QThread):
             # 处理其他所有错误
             print(f"后台上传 {basename} 时发生未知错误: {e_api}")
             traceback.print_exc()
-    # --- [结束新增] ---
 
 
     def _scan_and_process(self):
@@ -745,14 +762,66 @@ class DetectionThread(QThread):
                 def process_defect(task, img, save_dir):
                     x1, y1, x2, y2, defect_id, x_orig, y_orig, w_orig, h_orig, cx, cy = task
                     roi = img[y1:y2, x1:x2].copy()
+                    
+                    # 缺陷框相对于 crop 图像的坐标
                     rel_x, rel_y = max(0, x_orig - x1), max(0, y_orig - y1)
                     rel_x2, rel_y2 = min(roi.shape[1], rel_x + w_orig), min(roi.shape[0], rel_y + h_orig)
+                    
                     if rel_x2 > rel_x and rel_y2 > rel_y:
                         cv2.rectangle(roi, (rel_x, rel_y), (rel_x2, rel_y2), (0, 0, 255), 1)
-                    filename = f"{defect_id}_center({cx},{cy}).png"
-                    # --- 添加 .png 后缀检查 ---
-                    if not filename.lower().endswith(".png"): filename += ".png"
-                    cv2.imwrite(os.path.join(save_dir, filename), roi)
+                    
+                    # --- 修改: 提取基础文件名 (不带.png) ---
+                    base_filename = f"{defect_id}_center({cx},{cy})"
+                    img_filename = f"{base_filename}.png"
+                    txt_filename = f"{base_filename}.txt"
+                    
+                    img_save_path = os.path.join(save_dir, img_filename)
+                    txt_save_path = os.path.join(save_dir, txt_filename)
+                    # --- 结束修改 ---
+
+                    cv2.imwrite(img_save_path, roi)
+                    
+                    # --- 新增: 生成 YOLO 标签 ---
+                    try:
+                        # 1. 获取图像尺寸 (crop 后的 ROI)
+                        img_h, img_w = roi.shape[:2]
+                        if img_w == 0 or img_h == 0:
+                            print(f"警告: 无法为 {img_filename} 生成YOLO标签，图像尺寸为0")
+                            return defect_id
+
+                        # 2. 获取框体坐标 (相对于 crop 后的 ROI)
+                        box_x1, box_y1 = rel_x, rel_y
+                        box_x2, box_y2 = rel_x2, rel_y2
+                        
+                        # 3. 计算 YOLO 格式
+                        box_w = box_x2 - box_x1
+                        box_h = box_y2 - box_y1
+                        
+                        # 确保 w, h > 0
+                        if box_w <= 0 or box_h <= 0:
+                            print(f"警告: 无法为 {img_filename} 生成YOLO标签，缺陷框尺寸为0")
+                            return defect_id
+
+                        x_center = box_x1 + (box_w / 2)
+                        y_center = box_y1 + (box_h / 2)
+                        
+                        # 4. 归一化
+                        x_center_norm = x_center / img_w
+                        y_center_norm = y_center / img_h
+                        width_norm = box_w / img_w
+                        height_norm = box_h / img_h
+                        
+                        # 5. 格式化字符串 (class_id = 0)
+                        yolo_line = f"0 {x_center_norm:.6f} {y_center_norm:.6f} {width_norm:.6f} {height_norm:.6f}"
+                        
+                        # 6. 写入文件
+                        with open(txt_save_path, 'w', encoding='utf-8') as f:
+                            f.write(yolo_line)
+                            
+                    except Exception as e_yolo:
+                        print(f"生成YOLO标签时出错 ({img_filename}): {e_yolo}")
+                    # --- 结束新增 ---
+
                     return defect_id
 
                 num_threads = min(8, max(2, len(tasks) // 10 + 1))
